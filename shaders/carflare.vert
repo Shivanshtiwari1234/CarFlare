@@ -1,7 +1,9 @@
+
 #version 450
 
 layout(location = 0) in vec3 inPosition;
-layout(location = 0) out vec4 objectColor;
+
+layout(location = 0) out vec3 worldPosition;
 
 layout(push_constant) uniform PushData {
     mat4 mvp;
@@ -10,5 +12,5 @@ layout(push_constant) uniform PushData {
 
 void main() {
     gl_Position = pushData.mvp * vec4(inPosition, 1.0);
-    objectColor = pushData.color;
+    worldPosition = inPosition;
 }

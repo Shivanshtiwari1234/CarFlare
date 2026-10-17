@@ -702,9 +702,9 @@ class CarFlare {
 
     void createPipeline() {
         auto vertCode = readShader(
-            std::string(SHADER_DIR) + "/cube.vert.spv");
+            std::string(SHADER_DIR) + "/carflare.vert.spv");
         auto fragCode = readShader(
-            std::string(SHADER_DIR) + "/cube.frag.spv");
+            std::string(SHADER_DIR) + "/carflare.frag.spv");
 
         VkShaderModule vert = createShaderModule(vertCode);
         VkShaderModule frag = createShaderModule(fragCode);
@@ -976,7 +976,7 @@ class CarFlare {
             throw std::runtime_error("Command buffer begin failed");
 
         std::array<VkClearValue, 2> clear{};
-        clear[0].color = {{0.025f, 0.035f, 0.065f, 1.0f}};
+        clear[0].color = {{0.43f, 0.68f, 0.88f, 1.0f}};
         clear[1].depthStencil = {1.0f, 0};
 
         VkRenderPassBeginInfo render{};
@@ -1036,50 +1036,100 @@ class CarFlare {
 
         const float roadOffset = std::fmod(time * speed * 0.9f, 8.0f);
 
-        // Road slab and shoulders.
-        drawCube(command, {0.0f, -0.22f, -28.0f}, {5.3f, 0.18f, 62.0f},
-                 {0.12f, 0.14f, 0.17f, 1.0f});
-        drawCube(command, {-5.55f, -0.20f, -28.0f}, {0.25f, 0.20f, 62.0f},
-                 {0.75f, 0.17f, 0.12f, 1.0f});
-        drawCube(command, { 5.55f, -0.20f, -28.0f}, {0.25f, 0.20f, 62.0f},
-                 {0.75f, 0.17f, 0.12f, 1.0f});
+        // Ground: muted grass and dry roadside earth beyond the asphalt.
+        drawCube(command, {0.0f, -0.52f, -30.0f}, {45.0f, 0.22f, 70.0f},
+                 {0.25f, 0.34f, 0.20f, 1.0f});
+        drawCube(command, {0.0f, -0.31f, -28.0f}, {5.65f, 0.16f, 62.0f},
+                 {0.31f, 0.32f, 0.31f, 1.0f});
 
-        // Broken white center line; the segments cycle toward the camera.
+        // Asphalt carriageway and narrow, pale concrete road edges.
+        drawCube(command, {0.0f, -0.20f, -28.0f}, {5.15f, 0.12f, 62.0f},
+                 {0.19f, 0.20f, 0.21f, 1.0f});
+        drawCube(command, {-5.28f, -0.17f, -28.0f}, {0.16f, 0.10f, 62.0f},
+                 {0.57f, 0.58f, 0.55f, 1.0f});
+        drawCube(command, { 5.28f, -0.17f, -28.0f}, {0.16f, 0.10f, 62.0f},
+                 {0.57f, 0.58f, 0.55f, 1.0f});
+
+        // Continuous white edge lines.
+        drawCube(command, {-4.90f, -0.065f, -28.0f}, {0.045f, 0.018f, 62.0f},
+                 {0.86f, 0.87f, 0.84f, 1.0f});
+        drawCube(command, { 4.90f, -0.065f, -28.0f}, {0.045f, 0.018f, 62.0f},
+                 {0.86f, 0.87f, 0.84f, 1.0f});
+
+        // Broken white centre line, scrolling toward the camera.
         for (int i = 0; i < 18; ++i) {
-            float z = -78.0f + std::fmod(i * 8.0f + roadOffset + 88.0f, 88.0f);
-            drawCube(command, {0.0f, -0.015f, z}, {0.075f, 0.025f, 2.0f},
-                     {0.92f, 0.94f, 0.96f, 1.0f});
+            const float z = -78.0f + std::fmod(i * 8.0f + roadOffset + 88.0f, 88.0f);
+            drawCube(command, {0.0f, -0.055f, z}, {0.055f, 0.018f, 2.15f},
+                     {0.91f, 0.92f, 0.88f, 1.0f});
         }
 
-        // Simple roadside posts provide a stronger sense of forward motion.
+        // Distant low hills break up the horizon. Their subdued colours keep
+        // the road and car as the visual focus.
+        drawCube(command, {-13.0f, 1.8f, -58.0f}, {9.0f, 2.5f, 7.0f},
+                 {0.39f, 0.45f, 0.34f, 1.0f});
+        drawCube(command, {-25.0f, 2.4f, -68.0f}, {11.0f, 3.0f, 8.0f},
+                 {0.43f, 0.48f, 0.37f, 1.0f});
+        drawCube(command, { 14.0f, 1.9f, -61.0f}, {10.0f, 2.7f, 8.0f},
+                 {0.40f, 0.46f, 0.35f, 1.0f});
+        drawCube(command, { 27.0f, 2.6f, -70.0f}, {12.0f, 3.2f, 9.0f},
+                 {0.45f, 0.49f, 0.39f, 1.0f});
+
+        // Steel guardrails with regularly spaced grey support posts.
         for (int i = 0; i < 20; ++i) {
-            float z = -82.0f + std::fmod(i * 5.0f + roadOffset * 0.7f + 90.0f, 90.0f);
+            const float z = -82.0f + std::fmod(i * 5.0f + roadOffset * 0.7f + 90.0f, 90.0f);
             for (int side : {-1, 1}) {
-                drawCube(command, {side * 6.2f, 0.25f, z},
-                         {0.12f, 0.48f, 0.12f},
-                         {0.95f, 0.72f, 0.22f, 1.0f});
+                const float x = side * 5.65f;
+                drawCube(command, {x, 0.02f, z}, {0.075f, 0.42f, 0.075f},
+                         {0.43f, 0.45f, 0.44f, 1.0f});
+                // Small reflector on each post.
+                drawCube(command, {x - side * 0.06f, 0.20f, z},
+                         {0.025f, 0.075f, 0.07f},
+                         {0.82f, 0.78f, 0.58f, 1.0f});
             }
         }
+        drawCube(command, {-5.66f, 0.42f, -28.0f}, {0.09f, 0.09f, 45.0f},
+                 {0.48f, 0.50f, 0.49f, 1.0f});
+        drawCube(command, { 5.66f, 0.42f, -28.0f}, {0.09f, 0.09f, 45.0f},
+                 {0.48f, 0.50f, 0.49f, 1.0f});
 
-        // Car body, bonnet, cabin, glass and four dark wheels.
+        // Compact metallic-blue sports car. The body is built from overlapping
+        // simple meshes, so it remains lightweight on integrated graphics.
         const float carZ = 2.0f;
-        drawCube(command, {carX, 0.42f, carZ}, {1.0f, 0.34f, 1.75f},
-                 {0.82f, 0.035f, 0.055f, 1.0f});
-        drawCube(command, {carX, 0.78f, carZ - 0.30f}, {0.70f, 0.40f, 0.82f},
-                 {0.72f, 0.78f, 0.84f, 1.0f});
-        drawCube(command, {carX, 0.79f, carZ - 0.30f}, {0.62f, 0.32f, 0.74f},
-                 {0.035f, 0.12f, 0.18f, 1.0f});
-        drawCube(command, {carX, 0.34f, carZ - 1.55f}, {0.72f, 0.12f, 0.20f},
-                 {1.0f, 0.82f, 0.30f, 1.0f});
-        drawCube(command, {carX, 0.34f, carZ + 1.55f}, {0.72f, 0.12f, 0.18f},
-                 {0.95f, 0.02f, 0.025f, 1.0f});
+        drawCube(command, {carX, 0.40f, carZ}, {0.94f, 0.31f, 1.70f},
+                 {0.055f, 0.22f, 0.48f, 1.0f});
+        drawCube(command, {carX, 0.47f, carZ - 1.18f}, {0.78f, 0.20f, 0.48f},
+                 {0.07f, 0.28f, 0.57f, 1.0f});
+        drawCube(command, {carX, 0.74f, carZ - 0.32f}, {0.66f, 0.35f, 0.79f},
+                 {0.055f, 0.075f, 0.095f, 1.0f});
+        // Subtle roof panel and front/rear bumpers.
+        drawCube(command, {carX, 1.08f, carZ - 0.34f}, {0.52f, 0.055f, 0.53f},
+                 {0.07f, 0.24f, 0.43f, 1.0f});
+        drawCube(command, {carX, 0.29f, carZ - 1.69f}, {0.78f, 0.09f, 0.12f},
+                 {0.10f, 0.11f, 0.12f, 1.0f});
+        drawCube(command, {carX, 0.29f, carZ + 1.69f}, {0.78f, 0.09f, 0.12f},
+                 {0.10f, 0.11f, 0.12f, 1.0f});
 
+        // Warm-white headlights and red tail lamps.
+        for (int side : {-1, 1}) {
+            drawCube(command, {carX + side * 0.61f, 0.43f, carZ - 1.73f},
+                     {0.19f, 0.085f, 0.045f},
+                     {0.95f, 0.91f, 0.76f, 1.0f});
+            drawCube(command, {carX + side * 0.61f, 0.43f, carZ + 1.73f},
+                     {0.19f, 0.085f, 0.045f},
+                     {0.72f, 0.035f, 0.025f, 1.0f});
+        }
+
+        // Four dark tyres and understated metallic hubs.
         for (int side : {-1, 1}) {
             for (int axle : {-1, 1}) {
-                drawCube(command,
-                    {carX + side * 0.98f, 0.12f, carZ + axle * 1.05f},
-                    {0.20f, 0.34f, 0.42f},
-                    {0.025f, 0.03f, 0.04f, 1.0f});
+                const float wheelX = carX + side * 0.91f;
+                const float wheelZ = carZ + axle * 1.03f;
+                drawCube(command, {wheelX, 0.13f, wheelZ},
+                         {0.18f, 0.30f, 0.39f},
+                         {0.035f, 0.038f, 0.04f, 1.0f});
+                drawCube(command, {wheelX + side * 0.095f, 0.13f, wheelZ},
+                         {0.025f, 0.16f, 0.20f},
+                         {0.43f, 0.45f, 0.46f, 1.0f});
             }
         }
 
