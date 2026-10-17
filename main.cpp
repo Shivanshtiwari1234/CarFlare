@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -153,7 +155,7 @@ class CarFlare {
         glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
         window = glfwCreateWindow(
-            WIDTH, HEIGHT, "Car Flare - 3D Cube",
+            WIDTH, HEIGHT, "CarFlare - Endless Drive | W A S D",
             nullptr, nullptr);
 
         if (!window)
@@ -805,9 +807,9 @@ class CarFlare {
         dynamic.pDynamicStates = dynamicStates;
 
         VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         push.offset = 0;
-        push.size = sizeof(glm::mat4);
+        push.size = sizeof(glm::mat4) + sizeof(glm::vec4);
 
         VkPipelineLayoutCreateInfo layout{};
         layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -929,33 +931,41 @@ class CarFlare {
         imagesInFlight.assign(swapImages.size(), VK_NULL_HANDLE);
     }
 
-    glm::mat4 makeMVP() {
-        float time = static_cast<float>(glfwGetTime());
-
-        glm::mat4 model(1.0f);
-        model = glm::rotate(
-            model, time * glm::radians(45.0f),
-            glm::vec3(0.4f, 1.0f, 0.2f));
-        model = glm::rotate(
-            model, time * glm::radians(25.0f),
-            glm::vec3(1.0f, 0.0f, 0.0f));
+    glm::mat4 makeMVP(const glm::mat4& model) {
+        glm::vec3 cameraPos(0.0f, 5.2f, 10.5f);
+        glm::vec3 target(0.0f, 0.2f, -12.0f);
 
         glm::mat4 view = glm::lookAt(
-            glm::vec3(3.2f, 2.4f, 4.0f),
-            glm::vec3(0.0f, 0.0f, 0.0f),
-            glm::vec3(0.0f, 1.0f, 0.0f));
+            cameraPos, target, glm::vec3(0.0f, 1.0f, 0.0f));
 
         float aspect = static_cast<float>(swapExtent.width) /
                        static_cast<float>(swapExtent.height);
 
         glm::mat4 projection = glm::perspective(
-            glm::radians(45.0f), aspect, 0.1f, 100.0f);
-
-        // Vulkan's framebuffer Y direction is opposite to GLM's
-        // default perspective projection direction.
+            glm::radians(58.0f), aspect, 0.1f, 180.0f);
         projection[1][1] *= -1.0f;
 
         return projection * view * model;
+    }
+
+    void drawCube(VkCommandBuffer command, const glm::vec3& position,
+                  const glm::vec3& scale, const glm::vec4& color,
+                  float rotationY = 0.0f) {
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, position);
+        model = glm::rotate(model, rotationY, glm::vec3(0, 1, 0));
+        model = glm::scale(model, scale);
+
+        glm::mat4 mvp = makeMVP(model);
+        struct PushData {
+            glm::mat4 mvp;
+            glm::vec4 color;
+        } pushData{mvp, color};
+
+        vkCmdPushConstants(
+            command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT |
+            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushData), &pushData);
+        vkCmdDraw(command, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
     }
 
     void recordCommandBuffer(VkCommandBuffer command, uint32_t index) {
@@ -1003,13 +1013,75 @@ class CarFlare {
         vkCmdBindVertexBuffers(
             command, 0, 1, &vertexBuffer, &offset);
 
-        glm::mat4 mvp = makeMVP();
-        vkCmdPushConstants(
-            command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-            0, sizeof(glm::mat4), glm::value_ptr(mvp));
+        // Time-based movement makes the road markings loop forever.
+        const float time = static_cast<float>(glfwGetTime());
+        const bool forward = glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
+        const bool reverse = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
+        const bool left = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
+        const bool right = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
 
-        vkCmdDraw(
-            command, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+        static float speed = 0.0f;
+        static float carX = 0.0f;
+        static float lastTime = time;
+        float dt = std::clamp(time - lastTime, 0.0f, 0.05f);
+        lastTime = time;
+
+        if (forward) speed = std::min(speed + 13.0f * dt, 30.0f);
+        else if (reverse) speed = std::max(speed - 20.0f * dt, 0.0f);
+        else speed = std::max(speed - 4.0f * dt, 0.0f);
+
+        if (left) carX -= (3.0f + speed * 0.10f) * dt;
+        if (right) carX += (3.0f + speed * 0.10f) * dt;
+        carX = std::clamp(carX, -3.1f, 3.1f);
+
+        const float roadOffset = std::fmod(time * speed * 0.9f, 8.0f);
+
+        // Road slab and shoulders.
+        drawCube(command, {0.0f, -0.22f, -28.0f}, {5.3f, 0.18f, 62.0f},
+                 {0.12f, 0.14f, 0.17f, 1.0f});
+        drawCube(command, {-5.55f, -0.20f, -28.0f}, {0.25f, 0.20f, 62.0f},
+                 {0.75f, 0.17f, 0.12f, 1.0f});
+        drawCube(command, { 5.55f, -0.20f, -28.0f}, {0.25f, 0.20f, 62.0f},
+                 {0.75f, 0.17f, 0.12f, 1.0f});
+
+        // Broken white center line; the segments cycle toward the camera.
+        for (int i = 0; i < 18; ++i) {
+            float z = -78.0f + std::fmod(i * 8.0f + roadOffset + 88.0f, 88.0f);
+            drawCube(command, {0.0f, -0.015f, z}, {0.075f, 0.025f, 2.0f},
+                     {0.92f, 0.94f, 0.96f, 1.0f});
+        }
+
+        // Simple roadside posts provide a stronger sense of forward motion.
+        for (int i = 0; i < 20; ++i) {
+            float z = -82.0f + std::fmod(i * 5.0f + roadOffset * 0.7f + 90.0f, 90.0f);
+            for (int side : {-1, 1}) {
+                drawCube(command, {side * 6.2f, 0.25f, z},
+                         {0.12f, 0.48f, 0.12f},
+                         {0.95f, 0.72f, 0.22f, 1.0f});
+            }
+        }
+
+        // Car body, bonnet, cabin, glass and four dark wheels.
+        const float carZ = 2.0f;
+        drawCube(command, {carX, 0.42f, carZ}, {1.0f, 0.34f, 1.75f},
+                 {0.82f, 0.035f, 0.055f, 1.0f});
+        drawCube(command, {carX, 0.78f, carZ - 0.30f}, {0.70f, 0.40f, 0.82f},
+                 {0.72f, 0.78f, 0.84f, 1.0f});
+        drawCube(command, {carX, 0.79f, carZ - 0.30f}, {0.62f, 0.32f, 0.74f},
+                 {0.035f, 0.12f, 0.18f, 1.0f});
+        drawCube(command, {carX, 0.34f, carZ - 1.55f}, {0.72f, 0.12f, 0.20f},
+                 {1.0f, 0.82f, 0.30f, 1.0f});
+        drawCube(command, {carX, 0.34f, carZ + 1.55f}, {0.72f, 0.12f, 0.18f},
+                 {0.95f, 0.02f, 0.025f, 1.0f});
+
+        for (int side : {-1, 1}) {
+            for (int axle : {-1, 1}) {
+                drawCube(command,
+                    {carX + side * 0.98f, 0.12f, carZ + axle * 1.05f},
+                    {0.20f, 0.34f, 0.42f},
+                    {0.025f, 0.03f, 0.04f, 1.0f});
+            }
+        }
 
         vkCmdEndRenderPass(command);
 

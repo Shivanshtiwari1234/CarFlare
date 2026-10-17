@@ -19,25 +19,38 @@ target_link_libraries(CarFlare PRIVATE
     glm::glm
 )
 
+# Compile GLSL shaders to SPIR-V
+set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 
-foreach(SHADER cube.vert cube.frag)
+set(SHADER_FILES
+    carflare.vert
+    carflare.frag
+)
+
+set(SPIRV_FILES)
+
+foreach(SHADER ${SHADER_FILES})
+    set(SOURCE "${SHADER_SOURCE_DIR}/${SHADER}")
+    set(OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.spv")
+
     add_custom_command(
-        OUTPUT "${SHADER_OUTPUT_DIR}/${SHADER}.spv"
-        COMMAND "${GLSLC}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}"
-            -o "${SHADER_OUTPUT_DIR}/${SHADER}.spv"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}"
+        OUTPUT "${OUTPUT}"
+        COMMAND "${GLSLC}" "${SOURCE}" -o "${OUTPUT}"
+        DEPENDS "${SOURCE}"
+        COMMENT "Compiling ${SHADER} to SPIR-V"
         VERBATIM
     )
-    list(APPEND SPIRV_OUTPUTS
-        "${SHADER_OUTPUT_DIR}/${SHADER}.spv")
+
+    list(APPEND SPIRV_FILES "${OUTPUT}")
 endforeach()
 
-add_custom_target(Shaders DEPENDS ${SPIRV_OUTPUTS})
-add_dependencies(CarFlare Shaders)
+add_custom_target(CarFlareShaders DEPENDS ${SPIRV_FILES})
+add_dependencies(CarFlare CarFlareShaders)
 
+# Tell the application where the compiled shaders are located
 target_compile_definitions(CarFlare PRIVATE
     SHADER_DIR="${SHADER_OUTPUT_DIR}"
 )
