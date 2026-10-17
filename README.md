@@ -26,3 +26,12 @@ simulate an endless road.
 The renderer loads `assets/car.obj` UV coordinates and samples `assets/colormap.png` through a Vulkan combined-image sampler. `assets/race.mtl` references that image as `map_Kd colormap.png` (the loader uses the corresponding PNG path directly). PNG decoding uses libpng, so install the libpng development package and make sure CMake can find it.
 
 The car texture is loaded from a path relative to the process working directory. Run CarFlare from the project root so `assets/car.obj` and `assets/colormap.png` resolve correctly.
+
+
+## Source layout
+
+- `main.cpp` contains the application entry point.
+- `carflare.hpp` exposes the small `CarFlare` application interface.
+- `carflare.cpp` contains the Vulkan renderer and game implementation.
+
+The build configuration compiles both C++ source files.

@@ -12,7 +12,7 @@ find_package(PNG REQUIRED)
 
 find_program(GLSLC glslc REQUIRED)
 
-add_executable(CarFlare main.cpp)
+add_executable(CarFlare main.cpp carflare.cpp)
 
 target_link_libraries(CarFlare PRIVATE
     Vulkan::Vulkan
