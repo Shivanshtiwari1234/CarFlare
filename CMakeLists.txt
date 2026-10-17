@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
+find_package(PNG REQUIRED)
 
 find_program(GLSLC glslc REQUIRED)
 
@@ -17,6 +18,7 @@ target_link_libraries(CarFlare PRIVATE
     Vulkan::Vulkan
     glfw
     glm::glm
+    PNG::PNG
 )
 
 # Compile GLSL shaders to SPIR-V

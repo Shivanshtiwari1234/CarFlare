@@ -4,6 +4,7 @@
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 
 #include <GLFW/glfw3.h>
+#include <png.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -33,6 +35,7 @@ constexpr int MAX_FRAMES = 2;
 struct Vertex {
     glm::vec3 position;
     glm::vec3 color;
+    glm::vec2 texCoord{0.0f, 0.0f};
 };
 
 const std::vector<Vertex> vertices = {
@@ -127,6 +130,18 @@ class CarFlare {
 
     VkBuffer vertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory vertexMemory = VK_NULL_HANDLE;
+    VkBuffer carModelBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory carModelMemory = VK_NULL_HANDLE;
+    uint32_t carModelVertexCount = 0;
+    bool carModelLoaded = false;
+
+    VkImage carTextureImage = VK_NULL_HANDLE;
+    VkDeviceMemory carTextureMemory = VK_NULL_HANDLE;
+    VkImageView carTextureView = VK_NULL_HANDLE;
+    VkSampler carTextureSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout textureSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool textureDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet textureDescriptorSet = VK_NULL_HANDLE;
 
     std::vector<VkImage> depthImages;
     std::vector<VkDeviceMemory> depthMemories;
@@ -140,6 +155,29 @@ class CarFlare {
 
     size_t currentFrame = 0;
     bool framebufferResized = false;
+    bool gameStarted = false;
+
+    static void mouseButtonCallback(GLFWwindow* w, int button, int action, int) {
+        if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS)
+            return;
+
+        auto* app = static_cast<CarFlare*>(glfwGetWindowUserPointer(w));
+        if (!app || app->gameStarted)
+            return;
+
+        double x = 0.0, y = 0.0;
+        int width = 0, height = 0;
+        glfwGetCursorPos(w, &x, &y);
+        glfwGetWindowSize(w, &width, &height);
+
+        // The green PLAY panel occupies the central lower portion of the menu.
+        if (width > 0 && height > 0 &&
+            x >= width * 0.35 && x <= width * 0.65 &&
+            y >= height * 0.53 && y <= height * 0.70) {
+            app->gameStarted = true;
+            glfwSetWindowTitle(w, "CarFlare - Endless Drive | W A S D");
+        }
+    }
 
     static void framebufferCallback(GLFWwindow* w, int, int) {
         auto* app = static_cast<CarFlare*>(
@@ -163,6 +201,8 @@ class CarFlare {
 
         glfwSetWindowUserPointer(window, this);
         glfwSetFramebufferSizeCallback(window, framebufferCallback);
+        glfwSetMouseButtonCallback(window, mouseButtonCallback);
+        glfwSetWindowTitle(window, "CarFlare | Click the green PLAY button");
     }
 
     void initVulkan() {
@@ -176,6 +216,9 @@ class CarFlare {
         createDevice();
         createCommandPool();
         createVertexBuffer();
+        loadCarOBJ("assets/car.obj");
+        createCarTexture("assets/colormap.png");
+        createTextureDescriptor();
         createSwapchainResources();
         createSync();
     }
@@ -410,6 +453,321 @@ class CarFlare {
         vkMapMemory(device, vertexMemory, 0, size, 0, &data);
         std::memcpy(data, vertices.data(), static_cast<size_t>(size));
         vkUnmapMemory(device, vertexMemory);
+    }
+
+    VkCommandBuffer beginOneTimeCommands() {
+        VkCommandBufferAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc.commandPool = commandPool;
+        alloc.commandBufferCount = 1;
+        VkCommandBuffer command{};
+        if (vkAllocateCommandBuffers(device, &alloc, &command) != VK_SUCCESS)
+            throw std::runtime_error("One-time command buffer allocation failed");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(command, &begin) != VK_SUCCESS)
+            throw std::runtime_error("One-time command buffer begin failed");
+        return command;
+    }
+
+    void endOneTimeCommands(VkCommandBuffer command) {
+        if (vkEndCommandBuffer(command) != VK_SUCCESS)
+            throw std::runtime_error("One-time command buffer end failed");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &command;
+        if (vkQueueSubmit(graphicsQueue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
+            vkQueueWaitIdle(graphicsQueue) != VK_SUCCESS)
+            throw std::runtime_error("Texture upload submission failed");
+        vkFreeCommandBuffers(device, commandPool, 1, &command);
+    }
+
+    void transitionTexture(VkImage image, VkImageLayout oldLayout,
+                          VkImageLayout newLayout) {
+        VkCommandBuffer command = beginOneTimeCommands();
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        VkPipelineStageFlags sourceStage, destinationStage;
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+                   newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        } else {
+            vkFreeCommandBuffers(device, commandPool, 1, &command);
+            throw std::runtime_error("Unsupported texture image transition");
+        }
+        vkCmdPipelineBarrier(command, sourceStage, destinationStage, 0,
+                             0, nullptr, 0, nullptr, 1, &barrier);
+        endOneTimeCommands(command);
+    }
+
+    void createCarTexture(const std::string& path) {
+        png_image png{};
+        png.version = PNG_IMAGE_VERSION;
+        if (!png_image_begin_read_from_file(&png, path.c_str()))
+            throw std::runtime_error("Could not open texture " + path + ": " + png.message);
+        png.format = PNG_FORMAT_RGBA;
+        std::vector<png_byte> pixels(PNG_IMAGE_SIZE(png));
+        if (!png_image_finish_read(&png, nullptr, pixels.data(), 0, nullptr)) {
+            std::string message = png.message;
+            png_image_free(&png);
+            throw std::runtime_error("Could not decode texture " + path + ": " + message);
+        }
+        const uint32_t width = png.width;
+        const uint32_t height = png.height;
+        png_image_free(&png);
+        if (!width || !height)
+            throw std::runtime_error("Texture has invalid dimensions: " + path);
+
+        const VkDeviceSize imageSize = static_cast<VkDeviceSize>(pixels.size());
+        VkBuffer stagingBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer, stagingMemory);
+        void* mapped = nullptr;
+        if (vkMapMemory(device, stagingMemory, 0, imageSize, 0, &mapped) != VK_SUCCESS)
+            throw std::runtime_error("Could not map texture staging buffer");
+        std::memcpy(mapped, pixels.data(), pixels.size());
+        vkUnmapMemory(device, stagingMemory);
+
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent = {width, height, 1};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateImage(device, &imageInfo, nullptr, &carTextureImage) != VK_SUCCESS)
+            throw std::runtime_error("Texture image creation failed");
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device, carTextureImage, &requirements);
+        VkMemoryAllocateInfo allocation{};
+        allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits,
+                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(device, &allocation, nullptr, &carTextureMemory) != VK_SUCCESS)
+            throw std::runtime_error("Texture image memory allocation failed");
+        vkBindImageMemory(device, carTextureImage, carTextureMemory, 0);
+        transitionTexture(carTextureImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkCommandBuffer command = beginOneTimeCommands();
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {width, height, 1};
+        vkCmdCopyBufferToImage(command, stagingBuffer, carTextureImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        endOneTimeCommands(command);
+        transitionTexture(carTextureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingMemory, nullptr);
+        carTextureView = createImageView(carTextureImage, VK_FORMAT_R8G8B8A8_SRGB,
+                                         VK_IMAGE_ASPECT_COLOR_BIT);
+
+        VkSamplerCreateInfo sampler{};
+        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler.magFilter = VK_FILTER_LINEAR;
+        sampler.minFilter = VK_FILTER_LINEAR;
+        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampler.anisotropyEnable = VK_FALSE;
+        sampler.maxAnisotropy = 1.0f;
+        sampler.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        sampler.unnormalizedCoordinates = VK_FALSE;
+        sampler.compareEnable = VK_FALSE;
+        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        if (vkCreateSampler(device, &sampler, nullptr, &carTextureSampler) != VK_SUCCESS)
+            throw std::runtime_error("Texture sampler creation failed");
+        std::cout << "Loaded texture: " << path << " (" << width << "x" << height << ")\n";
+    }
+
+    void createTextureDescriptor() {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo layout{};
+        layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout.bindingCount = 1;
+        layout.pBindings = &binding;
+        if (vkCreateDescriptorSetLayout(device, &layout, nullptr, &textureSetLayout) != VK_SUCCESS)
+            throw std::runtime_error("Texture descriptor-set layout creation failed");
+
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = 1;
+        VkDescriptorPoolCreateInfo pool{};
+        pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool.maxSets = 1;
+        pool.poolSizeCount = 1;
+        pool.pPoolSizes = &poolSize;
+        if (vkCreateDescriptorPool(device, &pool, nullptr, &textureDescriptorPool) != VK_SUCCESS)
+            throw std::runtime_error("Texture descriptor pool creation failed");
+        VkDescriptorSetAllocateInfo alloc{};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = textureDescriptorPool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &textureSetLayout;
+        if (vkAllocateDescriptorSets(device, &alloc, &textureDescriptorSet) != VK_SUCCESS)
+            throw std::runtime_error("Texture descriptor-set allocation failed");
+        VkDescriptorImageInfo image{};
+        image.sampler = carTextureSampler;
+        image.imageView = carTextureView;
+        image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = textureDescriptorSet;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image;
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
+
+    // OBJ loader: keeps each face corner's UV coordinate when triangulating.
+    void loadCarOBJ(const std::string& path) {
+        std::ifstream file(path);
+        if (!file) {
+            std::cerr << "No " << path << " found; using the built-in car.\n";
+            return;
+        }
+        std::vector<glm::vec3> positions;
+        std::vector<glm::vec2> texCoords;
+        std::vector<Vertex> mesh;
+        std::string line;
+        while (std::getline(file, line)) {
+            std::istringstream row(line);
+            std::string kind;
+            row >> kind;
+            if (kind == "v") {
+                glm::vec3 v{};
+                if (row >> v.x >> v.y >> v.z) positions.push_back(v);
+            } else if (kind == "vt") {
+                glm::vec2 uv{};
+                if (row >> uv.x >> uv.y) texCoords.push_back(uv);
+            } else if (kind == "f") {
+                struct Corner { int position = -1; int uv = -1; };
+                std::vector<Corner> face;
+                std::string token;
+                while (row >> token) {
+                    std::istringstream parts(token);
+                    std::string p, uv;
+                    std::getline(parts, p, '/');
+                    std::getline(parts, uv, '/');
+                    if (p.empty()) continue;
+                    int pi = std::stoi(p);
+                    if (pi < 0) pi = static_cast<int>(positions.size()) + pi;
+                    else --pi;
+                    int ti = -1;
+                    if (!uv.empty()) {
+                        ti = std::stoi(uv);
+                        if (ti < 0) ti = static_cast<int>(texCoords.size()) + ti;
+                        else --ti;
+                    }
+                    if (pi >= 0 && static_cast<size_t>(pi) < positions.size())
+                        face.push_back({pi, ti});
+                }
+                for (size_t i = 1; i + 1 < face.size(); ++i) {
+                    for (const Corner& c : {face[0], face[i], face[i + 1]}) {
+                        glm::vec2 uv(0.0f);
+                        if (c.uv >= 0 && static_cast<size_t>(c.uv) < texCoords.size())
+                            uv = texCoords[static_cast<size_t>(c.uv)];
+                        // OBJ's V axis is opposite the usual Vulkan texture convention.
+                        uv.y = 1.0f - uv.y;
+                        mesh.push_back({positions[static_cast<size_t>(c.position)],
+                                        {1.0f, 1.0f, 1.0f}, uv});
+                    }
+                }
+            }
+        }
+        if (mesh.empty()) {
+            std::cerr << "OBJ contains no usable triangles: " << path << "; using built-in car.\n";
+            return;
+        }
+        glm::vec3 minimum(std::numeric_limits<float>::max());
+        glm::vec3 maximum(std::numeric_limits<float>::lowest());
+        for (const auto& v : mesh) {
+            minimum = glm::min(minimum, v.position);
+            maximum = glm::max(maximum, v.position);
+        }
+        const glm::vec3 dimensions = maximum - minimum;
+        const glm::vec3 center = (maximum + minimum) * 0.5f;
+        const float largest = std::max({dimensions.x, dimensions.y, dimensions.z});
+        if (largest <= 0.0001f) {
+            std::cerr << "OBJ has invalid dimensions; using built-in car.\n";
+            return;
+        }
+        const float scale = 3.4f / std::max(dimensions.x,
+                                  std::max(dimensions.z, dimensions.y * 1.8f));
+        for (auto& v : mesh) {
+            v.position = (v.position - center) * scale;
+            v.position.y += 0.55f;
+        }
+        const VkDeviceSize size = sizeof(Vertex) * mesh.size();
+        createBuffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     carModelBuffer, carModelMemory);
+        void* data = nullptr;
+        if (vkMapMemory(device, carModelMemory, 0, size, 0, &data) != VK_SUCCESS)
+            throw std::runtime_error("Could not map car model buffer");
+        std::memcpy(data, mesh.data(), static_cast<size_t>(size));
+        vkUnmapMemory(device, carModelMemory);
+        carModelVertexCount = static_cast<uint32_t>(mesh.size());
+        carModelLoaded = true;
+        std::cout << "Loaded OBJ car model: " << path << " (" << carModelVertexCount / 3
+                  << " triangles, " << texCoords.size() << " UVs)\n";
+    }
+
+    void drawCarModel(VkCommandBuffer command, const glm::vec3& position,
+                      const glm::vec3& scale, const glm::vec4& color) {
+        if (!carModelLoaded) return;
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, position);
+        model = glm::scale(model, scale);
+        const glm::mat4 mvp = makeMVP(model);
+        struct PushData { glm::mat4 mvp; glm::vec4 color; glm::vec4 params; } pushData{mvp, color, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout, 0, 1, &textureDescriptorSet, 0, nullptr);
+        vkCmdPushConstants(command, pipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(PushData), &pushData);
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(command, 0, 1, &carModelBuffer, &offset);
+        vkCmdDraw(command, carModelVertexCount, 1, 0, 0);
+        vkCmdBindVertexBuffers(command, 0, 1, &vertexBuffer, &offset);
     }
 
     VkSurfaceFormatKHR chooseFormat(
@@ -728,7 +1086,7 @@ class CarFlare {
         binding.stride = sizeof(Vertex);
         binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-        std::array<VkVertexInputAttributeDescription, 2> attributes{};
+        std::array<VkVertexInputAttributeDescription, 3> attributes{};
 
         attributes[0].location = 0;
         attributes[0].binding = 0;
@@ -739,6 +1097,11 @@ class CarFlare {
         attributes[1].binding = 0;
         attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributes[1].offset = offsetof(Vertex, color);
+
+        attributes[2].location = 2;
+        attributes[2].binding = 0;
+        attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributes[2].offset = offsetof(Vertex, texCoord);
 
         VkPipelineVertexInputStateCreateInfo vertexInput{};
         vertexInput.sType =
@@ -809,10 +1172,12 @@ class CarFlare {
         VkPushConstantRange push{};
         push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         push.offset = 0;
-        push.size = sizeof(glm::mat4) + sizeof(glm::vec4);
+        push.size = sizeof(glm::mat4) + sizeof(glm::vec4) * 2;
 
         VkPipelineLayoutCreateInfo layout{};
         layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &textureSetLayout;
         layout.pushConstantRangeCount = 1;
         layout.pPushConstantRanges = &push;
 
@@ -960,8 +1325,11 @@ class CarFlare {
         struct PushData {
             glm::mat4 mvp;
             glm::vec4 color;
-        } pushData{mvp, color};
+            glm::vec4 params;
+        } pushData{mvp, color, glm::vec4(0.0f)};
 
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout, 0, 1, &textureDescriptorSet, 0, nullptr);
         vkCmdPushConstants(
             command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT |
             VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushData), &pushData);
@@ -1012,6 +1380,52 @@ class CarFlare {
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(
             command, 0, 1, &vertexBuffer, &offset);
+
+        // Home screen: a dark title panel and a green, clickable PLAY button.
+        // The menu is rendered instead of the driving scene until clicked.
+        if (!gameStarted) {
+            drawCube(command, {0.0f, 2.1f, -2.0f}, {4.7f, 2.0f, 0.18f},
+                     {0.055f, 0.075f, 0.105f, 1.0f});
+            drawCube(command, {0.0f, 2.1f, -1.88f}, {4.45f, 1.78f, 0.08f},
+                     {0.09f, 0.13f, 0.18f, 1.0f});
+            // Bright accent strips give the menu a clean game-launcher look.
+            drawCube(command, {0.0f, 3.02f, -1.78f}, {3.8f, 0.035f, 0.035f},
+                     {0.12f, 0.78f, 0.95f, 1.0f});
+            drawCube(command, {0.0f, 1.30f, -1.72f}, {1.55f, 0.34f, 0.14f},
+                     {0.12f, 0.72f, 0.36f, 1.0f});
+            drawCube(command, {0.0f, 1.30f, -1.62f}, {1.40f, 0.23f, 0.055f},
+                     {0.16f, 0.84f, 0.43f, 1.0f});
+            // Tiny block-letter PLAY label, built from the same cube geometry.
+            const glm::vec4 labelColor(0.96f, 1.0f, 0.97f, 1.0f);
+            const float labelY = 1.30f;
+            const float labelZ = -1.54f;
+            // P
+            drawCube(command, {-0.43f, labelY, labelZ}, {0.045f, 0.15f, 0.025f}, labelColor);
+            drawCube(command, {-0.35f, labelY + 0.065f, labelZ}, {0.12f, 0.035f, 0.025f}, labelColor);
+            drawCube(command, {-0.35f, labelY, labelZ}, {0.12f, 0.035f, 0.025f}, labelColor);
+            drawCube(command, {-0.28f, labelY + 0.035f, labelZ}, {0.035f, 0.045f, 0.025f}, labelColor);
+            // L
+            drawCube(command, {-0.12f, labelY, labelZ}, {0.04f, 0.15f, 0.025f}, labelColor);
+            drawCube(command, {-0.06f, labelY - 0.065f, labelZ}, {0.10f, 0.035f, 0.025f}, labelColor);
+            // A
+            drawCube(command, {0.10f, labelY, labelZ}, {0.04f, 0.15f, 0.025f}, labelColor);
+            drawCube(command, {0.22f, labelY, labelZ}, {0.04f, 0.15f, 0.025f}, labelColor);
+            drawCube(command, {0.16f, labelY + 0.065f, labelZ}, {0.10f, 0.035f, 0.025f}, labelColor);
+            drawCube(command, {0.16f, labelY, labelZ}, {0.10f, 0.025f, 0.025f}, labelColor);
+            // Y
+            drawCube(command, {0.36f, labelY + 0.045f, labelZ}, {0.04f, 0.07f, 0.025f}, labelColor, -0.65f);
+            drawCube(command, {0.45f, labelY + 0.045f, labelZ}, {0.04f, 0.07f, 0.025f}, labelColor, 0.65f);
+            drawCube(command, {0.405f, labelY - 0.055f, labelZ}, {0.04f, 0.07f, 0.025f}, labelColor);
+            // Small cyan side accents.
+            drawCube(command, {-2.05f, 2.1f, -1.70f}, {0.045f, 0.62f, 0.04f},
+                     {0.12f, 0.78f, 0.95f, 1.0f});
+            drawCube(command, { 2.05f, 2.1f, -1.70f}, {0.045f, 0.62f, 0.04f},
+                     {0.12f, 0.78f, 0.95f, 1.0f});
+            vkCmdEndRenderPass(command);
+            if (vkEndCommandBuffer(command) != VK_SUCCESS)
+                throw std::runtime_error("Command buffer recording failed");
+            return;
+        }
 
         // Time-based movement makes the road markings loop forever.
         const float time = static_cast<float>(glfwGetTime());
@@ -1110,23 +1524,29 @@ class CarFlare {
         drawCube(command, { 5.66f, 0.42f, -28.0f}, {0.09f, 0.09f, 45.0f},
                  {0.48f, 0.50f, 0.49f, 1.0f});
 
-        // Compact metallic-blue sports car. The body is built from overlapping
-        // simple meshes, so it remains lightweight on integrated graphics.
+        // Load an external OBJ when assets/car.obj exists; otherwise keep the
+        // original procedural car so the game remains playable out of the box.
         const float carZ = 2.0f;
-        drawCube(command, {carX, 0.40f, carZ}, {0.94f, 0.31f, 1.70f},
-                 {0.055f, 0.22f, 0.48f, 1.0f});
-        drawCube(command, {carX, 0.47f, carZ - 1.18f}, {0.78f, 0.20f, 0.48f},
-                 {0.07f, 0.28f, 0.57f, 1.0f});
-        drawCube(command, {carX, 0.74f, carZ - 0.32f}, {0.66f, 0.35f, 0.79f},
-                 {0.055f, 0.075f, 0.095f, 1.0f});
-        // Subtle roof panel and front/rear bumpers.
-        drawCube(command, {carX, 1.08f, carZ - 0.34f}, {0.52f, 0.055f, 0.53f},
-                 {0.07f, 0.24f, 0.43f, 1.0f});
-        drawCube(command, {carX, 0.29f, carZ - 1.69f}, {0.78f, 0.09f, 0.12f},
-                 {0.10f, 0.11f, 0.12f, 1.0f});
-        drawCube(command, {carX, 0.29f, carZ + 1.69f}, {0.78f, 0.09f, 0.12f},
-                 {0.10f, 0.11f, 0.12f, 1.0f});
+        if (carModelLoaded) {
+            drawCarModel(command, {carX, 0.0f, carZ}, {1.0f, 1.0f, 1.0f},
+                         {1.0f, 1.0f, 1.0f, 1.0f});
+        } else {
+            drawCube(command, {carX, 0.40f, carZ}, {0.94f, 0.31f, 1.70f},
+                     {0.055f, 0.22f, 0.48f, 1.0f});
+            drawCube(command, {carX, 0.47f, carZ - 1.18f}, {0.78f, 0.20f, 0.48f},
+                     {0.07f, 0.28f, 0.57f, 1.0f});
+            drawCube(command, {carX, 0.74f, carZ - 0.32f}, {0.66f, 0.35f, 0.79f},
+                     {0.055f, 0.075f, 0.095f, 1.0f});
+            drawCube(command, {carX, 1.08f, carZ - 0.34f}, {0.52f, 0.055f, 0.53f},
+                     {0.07f, 0.24f, 0.43f, 1.0f});
+            drawCube(command, {carX, 0.29f, carZ - 1.69f}, {0.78f, 0.09f, 0.12f},
+                     {0.10f, 0.11f, 0.12f, 1.0f});
+            drawCube(command, {carX, 0.29f, carZ + 1.69f}, {0.78f, 0.09f, 0.12f},
+                     {0.10f, 0.11f, 0.12f, 1.0f});
+        }
 
+        // Built-in lights and wheels are used only for the fallback car.
+        if (!carModelLoaded) {
         // Warm-white headlights and red tail lamps.
         for (int side : {-1, 1}) {
             drawCube(command, {carX + side * 0.61f, 0.43f, carZ - 1.73f},
@@ -1149,6 +1569,7 @@ class CarFlare {
                          {0.025f, 0.16f, 0.20f},
                          {0.43f, 0.45f, 0.46f, 1.0f});
             }
+        }
         }
 
         vkCmdEndRenderPass(command);
@@ -1291,6 +1712,22 @@ class CarFlare {
                 vkDestroyBuffer(device, vertexBuffer, nullptr);
             if (vertexMemory != VK_NULL_HANDLE)
                 vkFreeMemory(device, vertexMemory, nullptr);
+            if (carModelBuffer != VK_NULL_HANDLE)
+                vkDestroyBuffer(device, carModelBuffer, nullptr);
+            if (carModelMemory != VK_NULL_HANDLE)
+                vkFreeMemory(device, carModelMemory, nullptr);
+            if (textureDescriptorPool != VK_NULL_HANDLE)
+                vkDestroyDescriptorPool(device, textureDescriptorPool, nullptr);
+            if (textureSetLayout != VK_NULL_HANDLE)
+                vkDestroyDescriptorSetLayout(device, textureSetLayout, nullptr);
+            if (carTextureSampler != VK_NULL_HANDLE)
+                vkDestroySampler(device, carTextureSampler, nullptr);
+            if (carTextureView != VK_NULL_HANDLE)
+                vkDestroyImageView(device, carTextureView, nullptr);
+            if (carTextureImage != VK_NULL_HANDLE)
+                vkDestroyImage(device, carTextureImage, nullptr);
+            if (carTextureMemory != VK_NULL_HANDLE)
+                vkFreeMemory(device, carTextureMemory, nullptr);
 
             for (int i = 0; i < MAX_FRAMES; ++i) {
                 if (imageAvailable[i])
