@@ -754,10 +754,14 @@ class CarFlareImpl {
     }
 
     void drawCarModel(VkCommandBuffer command, const glm::vec3& position,
-                      const glm::vec3& scale, const glm::vec4& color) {
+                      const glm::vec3& scale, const glm::vec4& color,
+                      float yaw = 0.0f, float pitch = 0.0f, float roll = 0.0f) {
         if (!carModelLoaded) return;
         glm::mat4 model(1.0f);
         model = glm::translate(model, position);
+        model = glm::rotate(model, yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, pitch, glm::vec3(1.0f, 0.0f, 0.0f));
+        model = glm::rotate(model, roll, glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::scale(model, scale);
         const glm::mat4 mvp = makeMVP(model);
         struct PushData { glm::mat4 mvp; glm::vec4 color; glm::vec4 params; } pushData{mvp, color, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
@@ -1436,50 +1440,76 @@ class CarFlareImpl {
         const bool left = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
         const bool right = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
 
-        static float speed = 0.0f;       // Forward is positive; reverse is negative.
+        static float speed = 0.0f;       // World units per second; forward is positive.
         static float carX = 0.0f;
+        static float lateralVelocity = 0.0f;
+        static float yaw = 0.0f;
+        static float steeringAngle = 0.0f;
         static float roadTravel = 0.0f;
         static float lastTime = time;
-        const float dt = std::clamp(time - lastTime, 0.0f, 0.05f);
+        const float dt = std::clamp(time - lastTime, 0.0f, 0.033f);
         lastTime = time;
 
-        // Lightweight car dynamics: gradual throttle response, braking, drag,
-        // and a lower reverse speed. Speed units are world-units per second.
-        constexpr float MAX_FORWARD_SPEED = 34.0f;
-        constexpr float MAX_REVERSE_SPEED = 8.0f;
-        constexpr float ACCELERATION = 7.0f;
-        constexpr float BRAKING = 15.0f;
-        constexpr float ROLLING_DRAG = 1.15f;
+        // Fixed-step-friendly, physically inspired longitudinal dynamics.
+        // Values are tuned for this game's deliberately compact world scale.
+        constexpr float MAX_FORWARD_SPEED = 38.0f;
+        constexpr float MAX_REVERSE_SPEED = 9.0f;
+        constexpr float ENGINE_ACCEL = 8.2f;
+        constexpr float SERVICE_BRAKE = 18.0f;
+        constexpr float ROLLING_RESISTANCE = 0.32f;
+        constexpr float AERO_DRAG = 0.0085f;
+        constexpr float WHEELBASE = 2.55f;
+        constexpr float MAX_STEER = 0.30f;
+        constexpr float LATERAL_GRIP = 7.8f;
 
-        if (forward) {
-            if (speed < 0.0f)
-                speed = std::min(0.0f, speed + BRAKING * dt);
-            else
-                speed = std::min(MAX_FORWARD_SPEED, speed + ACCELERATION * dt);
+        const bool braking = (forward && speed < -0.05f) || (reverse && speed > 0.05f);
+        if (braking) {
+            const float sign = speed > 0.0f ? 1.0f : -1.0f;
+            speed -= sign * SERVICE_BRAKE * dt;
+            if (std::abs(speed) < SERVICE_BRAKE * dt) speed = 0.0f;
+        } else if (forward) {
+            speed = std::min(MAX_FORWARD_SPEED, speed + ENGINE_ACCEL * dt);
         } else if (reverse) {
-            if (speed > 0.0f)
-                speed = std::max(0.0f, speed - BRAKING * dt);
-            else
-                speed = std::max(-MAX_REVERSE_SPEED, speed - ACCELERATION * 0.65f * dt);
+            speed = std::max(-MAX_REVERSE_SPEED, speed - ENGINE_ACCEL * 0.58f * dt);
         } else {
-            // Coasting gradually slows the car instead of instantly stopping.
-            if (speed > 0.0f)
-                speed = std::max(0.0f, speed - ROLLING_DRAG * dt);
-            else if (speed < 0.0f)
-                speed = std::min(0.0f, speed + ROLLING_DRAG * dt);
+            const float resistance = ROLLING_RESISTANCE + AERO_DRAG * speed * speed;
+            if (speed > 0.0f) speed = std::max(0.0f, speed - resistance * dt);
+            else if (speed < 0.0f) speed = std::min(0.0f, speed + resistance * dt);
         }
 
-        // Integrate distance over time, so road motion responds to actual speed
-        // rather than multiplying elapsed time by the current speed.
+        const float steerInput = (right ? 1.0f : 0.0f) - (left ? 1.0f : 0.0f);
+        const float speedFactor = std::clamp(std::abs(speed) / 12.0f, 0.0f, 1.0f);
+        const float targetSteer = steerInput * MAX_STEER * (1.0f - 0.62f * speedFactor);
+        // Steering rack has a finite response rate instead of teleporting angles.
+        steeringAngle += (targetSteer - steeringAngle) * std::min(1.0f, dt * 3.6f);
+
+        // Bicycle-model yaw rate, plus lateral tyre force that damps slip.
+        const float yawRate = (std::abs(speed) > 0.01f)
+            ? (speed / WHEELBASE) * std::tan(steeringAngle) : 0.0f;
+        yaw += yawRate * dt;
+        yaw = std::remainder(yaw, 6.28318530718f);
+        const float desiredLateral = speed * std::sin(yaw);
+        const float lateralAcceleration = std::clamp(
+            (desiredLateral - lateralVelocity) * LATERAL_GRIP,
+            -13.0f, 13.0f);
+        lateralVelocity += lateralAcceleration * dt;
+        carX += lateralVelocity * dt;
+
+        // Grass has much less grip; the guardrail behaves as a compliant barrier.
+        if (std::abs(carX) > 4.15f) {
+            speed *= std::max(0.0f, 1.0f - 1.4f * dt);
+            lateralVelocity *= std::max(0.0f, 1.0f - 2.5f * dt);
+        }
+        if (std::abs(carX) > 4.65f) {
+            carX = std::copysign(4.65f, carX);
+            lateralVelocity = -lateralVelocity * 0.22f;
+            speed *= 0.72f;
+        }
+        carX = std::clamp(carX, -4.65f, 4.65f);
+
+        // Road scrolling follows vehicle speed; integration remains frame-time based.
         roadTravel += speed * dt;
         const float roadOffset = std::fmod(roadTravel * 0.9f + 800.0f, 8.0f);
-
-        // Steering becomes more responsive with speed, but remains controllable.
-        const float steeringRate = 1.8f + std::min(std::abs(speed) / 34.0f, 1.0f) * 2.2f;
-        const float steeringDirection = speed < -0.1f ? -1.0f : 1.0f;
-        if (left) carX -= steeringDirection * steeringRate * dt;
-        if (right) carX += steeringDirection * steeringRate * dt;
-        carX = std::clamp(carX, -3.1f, 3.1f);
 
         // Ground: muted grass and dry roadside earth beyond the asphalt.
         drawCube(command, {0.0f, -0.52f, -30.0f}, {45.0f, 0.22f, 70.0f},
@@ -1531,7 +1561,9 @@ class CarFlareImpl {
         const float carZ = 2.0f;
         if (carModelLoaded) {
             drawCarModel(command, {carX, 0.0f, carZ}, {1.0f, 1.0f, 1.0f},
-                         {1.0f, 1.0f, 1.0f, 1.0f});
+                         {1.0f, 1.0f, 1.0f, 1.0f}, -yaw * 0.65f,
+                         std::clamp(-speed * 0.0015f, -0.045f, 0.045f),
+                         std::clamp(-lateralVelocity * 0.025f, -0.12f, 0.12f));
         } else {
             drawCube(command, {carX, 0.40f, carZ}, {0.94f, 0.31f, 1.70f},
                      {0.055f, 0.22f, 0.48f, 1.0f});

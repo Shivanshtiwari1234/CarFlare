@@ -1,37 +1,44 @@
-CarFlare — Endless Drive update
+# CarFlare — Endless Drive
 
-Replace your existing main.cpp with this main.cpp and replace:
-  shaders/cube.vert
-  shaders/cube.frag
+A small Vulkan driving game using GLFW, GLM, libpng, and GLSL shaders.
 
-CMakeLists.txt can remain unchanged.
+## Build
 
-Build from the project root:
-  cmake -S . -B build -G Ninja
-  cmake --build build
-  ./build/CarFlare
+Dependencies: a C++20 compiler, CMake, Ninja (optional), Vulkan SDK/loader and headers, GLFW, GLM, libpng, and `glslc`.
 
-Controls:
-  W = accelerate
-  S = brake / slow down
-  A = steer left
-  D = steer right
-  Esc = close the window
+From this directory:
 
-This keeps the existing Vulkan setup and uses colored cube meshes for the car,
-road, lane markers, and roadside posts. The lane markers and posts loop to
-simulate an endless road.
-## Textured OBJ car
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build
+./build/CarFlare
+```
 
-The renderer loads `assets/car.obj` UV coordinates and samples `assets/colormap.png` through a Vulkan combined-image sampler. `assets/race.mtl` references that image as `map_Kd colormap.png` (the loader uses the corresponding PNG path directly). PNG decoding uses libpng, so install the libpng development package and make sure CMake can find it.
+Run from the project root so `assets/car.obj` and `assets/colormap.png` resolve.
 
-The car texture is loaded from a path relative to the process working directory. Run CarFlare from the project root so `assets/car.obj` and `assets/colormap.png` resolve correctly.
+## Controls
 
+- **W** — accelerate
+- **S** — brake or reverse
+- **A / D** — steer
+- **Esc** — close the window
 
-## Source layout
+Click **PLAY** in the start screen.
 
-- `main.cpp` contains the application entry point.
-- `carflare.hpp` exposes the small `CarFlare` application interface.
-- `carflare.cpp` contains the Vulkan renderer and game implementation.
+## Current driving and rendering systems
 
-The build configuration compiles both C++ source files.
+- Time-step-based acceleration, braking, rolling resistance, and speed-dependent aerodynamic drag.
+- A bicycle-model-inspired steering response, yaw, lateral inertia, tyre-grip damping, and limited body roll/pitch cues.
+- Reduced grip and speed on the roadside, plus a compliant boundary response at the guardrail.
+- Directional sunlight, hemispheric ambient fill, diffuse shading, restrained specular highlights, and a mild tone-mapping shoulder in the fragment shader.
+- UV-textured OBJ car with a built-in procedural fallback.
+
+These are game-oriented approximations, not a validated automotive simulation. This revision does **not** yet implement shadow mapping, dynamic weather, physically based material maps, full suspension/wheel rotation, collision meshes, or a full rigid-body solver.
+
+## Layout
+
+- `main.cpp` — application entry point.
+- `carflare.hpp` — public application interface.
+- `carflare.cpp` — Vulkan renderer and driving implementation.
+- `shaders/carflare.vert`, `shaders/carflare.frag` — vertex and fragment shaders.
+- `assets/` — car mesh and texture.
