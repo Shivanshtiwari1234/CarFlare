@@ -1020,21 +1020,50 @@ class CarFlare {
         const bool left = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
         const bool right = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
 
-        static float speed = 0.0f;
+        static float speed = 0.0f;       // Forward is positive; reverse is negative.
         static float carX = 0.0f;
+        static float roadTravel = 0.0f;
         static float lastTime = time;
-        float dt = std::clamp(time - lastTime, 0.0f, 0.05f);
+        const float dt = std::clamp(time - lastTime, 0.0f, 0.05f);
         lastTime = time;
 
-        if (forward) speed = std::min(speed + 13.0f * dt, 30.0f);
-        else if (reverse) speed = std::max(speed - 20.0f * dt, 0.0f);
-        else speed = std::max(speed - 4.0f * dt, 0.0f);
+        // Lightweight car dynamics: gradual throttle response, braking, drag,
+        // and a lower reverse speed. Speed units are world-units per second.
+        constexpr float MAX_FORWARD_SPEED = 34.0f;
+        constexpr float MAX_REVERSE_SPEED = 8.0f;
+        constexpr float ACCELERATION = 7.0f;
+        constexpr float BRAKING = 15.0f;
+        constexpr float ROLLING_DRAG = 1.15f;
 
-        if (left) carX -= (3.0f + speed * 0.10f) * dt;
-        if (right) carX += (3.0f + speed * 0.10f) * dt;
+        if (forward) {
+            if (speed < 0.0f)
+                speed = std::min(0.0f, speed + BRAKING * dt);
+            else
+                speed = std::min(MAX_FORWARD_SPEED, speed + ACCELERATION * dt);
+        } else if (reverse) {
+            if (speed > 0.0f)
+                speed = std::max(0.0f, speed - BRAKING * dt);
+            else
+                speed = std::max(-MAX_REVERSE_SPEED, speed - ACCELERATION * 0.65f * dt);
+        } else {
+            // Coasting gradually slows the car instead of instantly stopping.
+            if (speed > 0.0f)
+                speed = std::max(0.0f, speed - ROLLING_DRAG * dt);
+            else if (speed < 0.0f)
+                speed = std::min(0.0f, speed + ROLLING_DRAG * dt);
+        }
+
+        // Integrate distance over time, so road motion responds to actual speed
+        // rather than multiplying elapsed time by the current speed.
+        roadTravel += speed * dt;
+        const float roadOffset = std::fmod(roadTravel * 0.9f + 800.0f, 8.0f);
+
+        // Steering becomes more responsive with speed, but remains controllable.
+        const float steeringRate = 1.8f + std::min(std::abs(speed) / 34.0f, 1.0f) * 2.2f;
+        const float steeringDirection = speed < -0.1f ? -1.0f : 1.0f;
+        if (left) carX -= steeringDirection * steeringRate * dt;
+        if (right) carX += steeringDirection * steeringRate * dt;
         carX = std::clamp(carX, -3.1f, 3.1f);
-
-        const float roadOffset = std::fmod(time * speed * 0.9f, 8.0f);
 
         // Ground: muted grass and dry roadside earth beyond the asphalt.
         drawCube(command, {0.0f, -0.52f, -30.0f}, {45.0f, 0.22f, 70.0f},
@@ -1062,17 +1091,6 @@ class CarFlare {
             drawCube(command, {0.0f, -0.055f, z}, {0.055f, 0.018f, 2.15f},
                      {0.91f, 0.92f, 0.88f, 1.0f});
         }
-
-        // Distant low hills break up the horizon. Their subdued colours keep
-        // the road and car as the visual focus.
-        drawCube(command, {-13.0f, 1.8f, -58.0f}, {9.0f, 2.5f, 7.0f},
-                 {0.39f, 0.45f, 0.34f, 1.0f});
-        drawCube(command, {-25.0f, 2.4f, -68.0f}, {11.0f, 3.0f, 8.0f},
-                 {0.43f, 0.48f, 0.37f, 1.0f});
-        drawCube(command, { 14.0f, 1.9f, -61.0f}, {10.0f, 2.7f, 8.0f},
-                 {0.40f, 0.46f, 0.35f, 1.0f});
-        drawCube(command, { 27.0f, 2.6f, -70.0f}, {12.0f, 3.2f, 9.0f},
-                 {0.45f, 0.49f, 0.39f, 1.0f});
 
         // Steel guardrails with regularly spaced grey support posts.
         for (int i = 0; i < 20; ++i) {
