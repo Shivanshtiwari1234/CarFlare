@@ -30,9 +30,14 @@
 #define SHADER_DIR "shaders"
 #endif
 
+#ifndef ASSET_DIR
+#define ASSET_DIR "assets"
+#endif
+
 constexpr uint32_t WIDTH = 1000;
 constexpr uint32_t HEIGHT = 700;
 constexpr int MAX_FRAMES = 2;
+constexpr uint32_t MAX_HUD_GLYPHS = 12;
 
 struct Vertex {
     glm::vec3 position;
@@ -157,6 +162,16 @@ class CarFlareImpl {
     VkDescriptorPool textureDescriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet textureDescriptorSet = VK_NULL_HANDLE;
 
+    VkImage hudFontImage = VK_NULL_HANDLE;
+    VkDeviceMemory hudFontMemory = VK_NULL_HANDLE;
+    VkImageView hudFontView = VK_NULL_HANDLE;
+    VkSampler hudFontSampler = VK_NULL_HANDLE;
+    VkDescriptorSet hudFontDescriptorSet = VK_NULL_HANDLE;
+    VkBuffer hudVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory hudVertexMemory = VK_NULL_HANDLE;
+    VkPipeline hudPipeline = VK_NULL_HANDLE;
+    uint32_t hudVertexCount = 0;
+
     std::vector<VkImage> depthImages;
     std::vector<VkDeviceMemory> depthMemories;
     std::vector<VkImageView> depthViews;
@@ -239,8 +254,10 @@ class CarFlareImpl {
         createDevice();
         createCommandPool();
         createVertexBuffer();
-        loadCarOBJ("assets/car.obj");
-        createCarTexture("assets/colormap.png");
+        createHUDVertexBuffer();
+        loadCarOBJ(std::string(ASSET_DIR) + "/car.obj");
+        createCarTexture(std::string(ASSET_DIR) + "/colormap.png");
+        createFontTexture(std::string(ASSET_DIR) + "/fonts/anton_digits.png");
         createTextureDescriptor();
         createSwapchainResources();
         createSync();
@@ -484,6 +501,70 @@ class CarFlareImpl {
         vkUnmapMemory(device, vertexMemory);
     }
 
+    void createHUDVertexBuffer() {
+        createBuffer(sizeof(Vertex) * MAX_HUD_GLYPHS * 6,
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     hudVertexBuffer, hudVertexMemory);
+    }
+
+    void updateHUDText(const std::string& score, float top, float glyphWidth,
+                       float glyphHeight) {
+        const uint32_t glyphCount = std::min<uint32_t>(
+            static_cast<uint32_t>(score.size()), MAX_HUD_GLYPHS);
+        std::vector<Vertex> glyphs;
+        glyphs.reserve(glyphCount * 6);
+        // Clip-space HUD: keep the complete label centred at the top edge.
+        const float left = -0.5f * glyphWidth * glyphCount;
+        for (uint32_t i = 0; i < glyphCount; ++i) {
+            const float x0 = left + glyphWidth * i;
+            const float x1 = x0 + glyphWidth;
+            const float y0 = top + glyphHeight;
+            const float y1 = top;
+            const std::string atlasCharacters = "CARFLEPY0123456789";
+            const size_t glyphIndex = atlasCharacters.find(score[i]);
+            if (glyphIndex == std::string::npos) continue;
+            const float u0 = static_cast<float>(glyphIndex) / 18.0f;
+            const float u1 = static_cast<float>(glyphIndex + 1) / 18.0f;
+            const glm::vec3 white(1.0f);
+            glyphs.insert(glyphs.end(), {
+                {{x0,y0,0},white,{u0,1}}, {{x1,y0,0},white,{u1,1}}, {{x1,y1,0},white,{u1,0}},
+                {{x0,y0,0},white,{u0,1}}, {{x1,y1,0},white,{u1,0}}, {{x0,y1,0},white,{u0,0}}
+            });
+        }
+        void* mapped = nullptr;
+        const VkDeviceSize bytes = sizeof(Vertex) * glyphs.size();
+        if (vkMapMemory(device, hudVertexMemory, 0, bytes, 0, &mapped) != VK_SUCCESS)
+            throw std::runtime_error("Could not map HUD vertex buffer");
+        std::memcpy(mapped, glyphs.data(), static_cast<size_t>(bytes));
+        vkUnmapMemory(device, hudVertexMemory);
+        hudVertexCount = static_cast<uint32_t>(glyphs.size());
+    }
+
+    void drawScoreHUD(VkCommandBuffer command) {
+        // Compact numeric-only racing HUD.
+        updateHUDText(std::to_string(raceScore), -0.90f, 0.052f, 0.092f);
+        if (hudVertexCount == 0) return;
+        VkDeviceSize offset = 0;
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, hudPipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout, 0, 1, &hudFontDescriptorSet, 0, nullptr);
+        vkCmdBindVertexBuffers(command, 0, 1, &hudVertexBuffer, &offset);
+        vkCmdDraw(command, hudVertexCount, 1, 0, 0);
+    }
+
+    void drawMenuTitleHUD(VkCommandBuffer command) {
+        updateHUDText("CARFLARE", -0.62f, 0.095f, 0.15f);
+        if (hudVertexCount == 0) return;
+        VkDeviceSize offset = 0;
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, hudPipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout, 0, 1, &hudFontDescriptorSet, 0, nullptr);
+        vkCmdBindVertexBuffers(command, 0, 1, &hudVertexBuffer, &offset);
+        vkCmdDraw(command, hudVertexCount, 1, 0, 0);
+    }
+
     VkCommandBuffer beginOneTimeCommands() {
         VkCommandBufferAllocateInfo alloc{};
         alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -551,7 +632,8 @@ class CarFlareImpl {
         endOneTimeCommands(command);
     }
 
-    void createCarTexture(const std::string& path) {
+    void createTexture(const std::string& path, VkImage& image, VkDeviceMemory& memory,
+                       VkImageView& view, VkSampler& outSampler) {
         png_image png{};
         png.version = PNG_IMAGE_VERSION;
         if (!png_image_begin_read_from_file(&png, path.c_str()))
@@ -593,19 +675,19 @@ class CarFlareImpl {
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vkCreateImage(device, &imageInfo, nullptr, &carTextureImage) != VK_SUCCESS)
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS)
             throw std::runtime_error("Texture image creation failed");
         VkMemoryRequirements requirements{};
-        vkGetImageMemoryRequirements(device, carTextureImage, &requirements);
+        vkGetImageMemoryRequirements(device, image, &requirements);
         VkMemoryAllocateInfo allocation{};
         allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits,
                                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(device, &allocation, nullptr, &carTextureMemory) != VK_SUCCESS)
+        if (vkAllocateMemory(device, &allocation, nullptr, &memory) != VK_SUCCESS)
             throw std::runtime_error("Texture image memory allocation failed");
-        vkBindImageMemory(device, carTextureImage, carTextureMemory, 0);
-        transitionTexture(carTextureImage, VK_IMAGE_LAYOUT_UNDEFINED,
+        vkBindImageMemory(device, image, memory, 0);
+        transitionTexture(image, VK_IMAGE_LAYOUT_UNDEFINED,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkCommandBuffer command = beginOneTimeCommands();
         VkBufferImageCopy region{};
@@ -614,32 +696,38 @@ class CarFlareImpl {
         region.imageSubresource.baseArrayLayer = 0;
         region.imageSubresource.layerCount = 1;
         region.imageExtent = {width, height, 1};
-        vkCmdCopyBufferToImage(command, stagingBuffer, carTextureImage,
+        vkCmdCopyBufferToImage(command, stagingBuffer, image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         endOneTimeCommands(command);
-        transitionTexture(carTextureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        transitionTexture(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingMemory, nullptr);
-        carTextureView = createImageView(carTextureImage, VK_FORMAT_R8G8B8A8_SRGB,
-                                         VK_IMAGE_ASPECT_COLOR_BIT);
+        view = createImageView(image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
 
-        VkSamplerCreateInfo sampler{};
-        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sampler.magFilter = VK_FILTER_LINEAR;
-        sampler.minFilter = VK_FILTER_LINEAR;
-        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.anisotropyEnable = VK_FALSE;
-        sampler.maxAnisotropy = 1.0f;
-        sampler.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
-        sampler.unnormalizedCoordinates = VK_FALSE;
-        sampler.compareEnable = VK_FALSE;
-        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        if (vkCreateSampler(device, &sampler, nullptr, &carTextureSampler) != VK_SUCCESS)
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.anisotropyEnable = VK_FALSE;
+        samplerInfo.maxAnisotropy = 1.0f;
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+        samplerInfo.compareEnable = VK_FALSE;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &outSampler) != VK_SUCCESS)
             throw std::runtime_error("Texture sampler creation failed");
         std::cout << "Loaded texture: " << path << " (" << width << "x" << height << ")\n";
+    }
+
+    void createCarTexture(const std::string& path) {
+        createTexture(path, carTextureImage, carTextureMemory, carTextureView, carTextureSampler);
+    }
+    void createFontTexture(const std::string& path) {
+        createTexture(path, hudFontImage, hudFontMemory, hudFontView, hudFontSampler);
     }
 
     void createTextureDescriptor() {
@@ -657,10 +745,10 @@ class CarFlareImpl {
 
         VkDescriptorPoolSize poolSize{};
         poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 1;
+        poolSize.descriptorCount = 2;
         VkDescriptorPoolCreateInfo pool{};
         pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool.maxSets = 1;
+        pool.maxSets = 2;
         pool.poolSizeCount = 1;
         pool.pPoolSizes = &poolSize;
         if (vkCreateDescriptorPool(device, &pool, nullptr, &textureDescriptorPool) != VK_SUCCESS)
@@ -672,6 +760,8 @@ class CarFlareImpl {
         alloc.pSetLayouts = &textureSetLayout;
         if (vkAllocateDescriptorSets(device, &alloc, &textureDescriptorSet) != VK_SUCCESS)
             throw std::runtime_error("Texture descriptor-set allocation failed");
+        if (vkAllocateDescriptorSets(device, &alloc, &hudFontDescriptorSet) != VK_SUCCESS)
+            throw std::runtime_error("HUD font descriptor-set allocation failed");
         VkDescriptorImageInfo image{};
         image.sampler = carTextureSampler;
         image.imageView = carTextureView;
@@ -683,6 +773,11 @@ class CarFlareImpl {
         write.descriptorCount = 1;
         write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         write.pImageInfo = &image;
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+        image.sampler = hudFontSampler;
+        image.imageView = hudFontView;
+        write.dstSet = hudFontDescriptorSet;
         vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     }
 
@@ -1296,6 +1391,27 @@ class CarFlareImpl {
 
         if (result != VK_SUCCESS)
             throw std::runtime_error("Graphics pipeline creation failed");
+
+        auto hudVertCode = readShader(std::string(SHADER_DIR) + "/hud.vert.spv");
+        auto hudFragCode = readShader(std::string(SHADER_DIR) + "/hud.frag.spv");
+        VkShaderModule hudVert = createShaderModule(hudVertCode);
+        VkShaderModule hudFrag = createShaderModule(hudFragCode);
+        stages[0].module = hudVert;
+        stages[1].module = hudFrag;
+        depth.depthTestEnable = VK_FALSE;
+        depth.depthWriteEnable = VK_FALSE;
+        blend.blendEnable = VK_TRUE;
+        blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend.colorBlendOp = VK_BLEND_OP_ADD;
+        blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        result = vkCreateGraphicsPipelines(
+            device, VK_NULL_HANDLE, 1, &info, nullptr, &hudPipeline);
+        vkDestroyShaderModule(device, hudVert, nullptr);
+        vkDestroyShaderModule(device, hudFrag, nullptr);
+        if (result != VK_SUCCESS)
+            throw std::runtime_error("HUD graphics pipeline creation failed");
     }
 
     void createFramebuffers() {
@@ -1568,6 +1684,9 @@ class CarFlareImpl {
             drawCube(command, {0.72f, py + 0.06f, pz}, {0.07f, 0.10f, 0.035f}, playCol,  0.55f);
             drawCube(command, {0.65f, py - 0.07f, pz}, {0.07f, 0.10f, 0.035f}, playCol);
 
+            // Anton title overlay replaces the menu's legacy cube-letter look.
+            drawMenuTitleHUD(command);
+
             vkCmdEndRenderPass(command);
             if (vkEndCommandBuffer(command) != VK_SUCCESS)
                 throw std::runtime_error("Command buffer recording failed");
@@ -1682,7 +1801,7 @@ class CarFlareImpl {
         const int numSegs = 28;
 
         for (int i = 0; i < numSegs; ++i) {
-            const float z = -1.0f - i * segLen;
+            const float z = 4.0f - i * segLen;
             // drawCube takes half-extents.  Using the full segment length here
             // made neighbouring coplanar surfaces overlap by almost a whole
             // segment, causing z-fighting on rails and painted edge lines.
@@ -1740,7 +1859,7 @@ class CarFlareImpl {
 
         // Segmented dual rails
         for (int i = 0; i < numSegs; ++i) {
-            const float z = -1.0f - i * segLen;
+            const float z = 4.0f - i * segLen;
             const float halfLen = (segLen + segOverlap) * 0.5f;
             drawCube(command, {-5.75f, 0.48f, z}, {0.10f, 0.08f, halfLen}, railCol);
             drawCube(command, { 5.75f, 0.48f, z}, {0.10f, 0.08f, halfLen}, railCol);
@@ -1798,6 +1917,9 @@ class CarFlareImpl {
         }
         }
 
+        // HUD is recorded last so it is always visible over the racing scene.
+        drawScoreHUD(command);
+
         vkCmdEndRenderPass(command);
 
         if (vkEndCommandBuffer(command) != VK_SUCCESS)
@@ -1816,6 +1938,10 @@ class CarFlareImpl {
         for (auto fb : framebuffers)
             vkDestroyFramebuffer(device, fb, nullptr);
         framebuffers.clear();
+
+        if (hudPipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(device, hudPipeline, nullptr);
+        hudPipeline = VK_NULL_HANDLE;
 
         if (pipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(device, pipeline, nullptr);
@@ -1966,6 +2092,18 @@ class CarFlareImpl {
                 vkDestroyImage(device, carTextureImage, nullptr);
             if (carTextureMemory != VK_NULL_HANDLE)
                 vkFreeMemory(device, carTextureMemory, nullptr);
+            if (hudVertexBuffer != VK_NULL_HANDLE)
+                vkDestroyBuffer(device, hudVertexBuffer, nullptr);
+            if (hudVertexMemory != VK_NULL_HANDLE)
+                vkFreeMemory(device, hudVertexMemory, nullptr);
+            if (hudFontSampler != VK_NULL_HANDLE)
+                vkDestroySampler(device, hudFontSampler, nullptr);
+            if (hudFontView != VK_NULL_HANDLE)
+                vkDestroyImageView(device, hudFontView, nullptr);
+            if (hudFontImage != VK_NULL_HANDLE)
+                vkDestroyImage(device, hudFontImage, nullptr);
+            if (hudFontMemory != VK_NULL_HANDLE)
+                vkFreeMemory(device, hudFontMemory, nullptr);
 
             for (int i = 0; i < MAX_FRAMES; ++i) {
                 if (imageAvailable[i])

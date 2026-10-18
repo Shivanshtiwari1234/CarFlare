@@ -30,6 +30,8 @@ file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 set(SHADER_FILES
     carflare.vert
     carflare.frag
+    hud.vert
+    hud.frag
 )
 
 set(SPIRV_FILES)
@@ -55,4 +57,5 @@ add_dependencies(CarFlare CarFlareShaders)
 # Tell the application where the compiled shaders are located
 target_compile_definitions(CarFlare PRIVATE
     SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
 )
