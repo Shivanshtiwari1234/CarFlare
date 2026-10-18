@@ -40,6 +40,18 @@ struct Vertex {
     glm::vec2 texCoord{0.0f, 0.0f};
 };
 
+// Keep one shared, non-overlapping block below Vulkan's guaranteed 128-byte
+// push-constant limit.  Some drivers do not preserve distinct values for
+// overlapping per-stage ranges, which corrupts transforms.
+struct PushData {
+    glm::mat4 mvp;
+    glm::vec4 color;
+    glm::vec4 params;
+};
+
+static_assert(sizeof(PushData) <= 128,
+              "Push constants must fit Vulkan's guaranteed minimum");
+
 const std::vector<Vertex> vertices = {
     // Front: red
     {{-1,-1, 1},{1,0.15f,0.15f}},
@@ -150,6 +162,11 @@ class CarFlareImpl {
     std::vector<VkImageView> depthViews;
     VkFormat depthFormat{};
 
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+    std::vector<VkImage> msaaColorImages;
+    std::vector<VkDeviceMemory> msaaColorMemories;
+    std::vector<VkImageView> msaaColorViews;
+
     std::array<VkSemaphore, MAX_FRAMES> imageAvailable{};
     std::array<VkSemaphore, MAX_FRAMES> renderFinished{};
     std::array<VkFence, MAX_FRAMES> inFlight{};
@@ -158,6 +175,8 @@ class CarFlareImpl {
     size_t currentFrame = 0;
     bool framebufferResized = false;
     bool gameStarted = false;
+    uint32_t raceScore = 0;
+    float scoredDistance = 0.0f;
 
     static void mouseButtonCallback(GLFWwindow* w, int button, int action, int) {
         if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS)
@@ -177,7 +196,9 @@ class CarFlareImpl {
             x >= width * 0.35 && x <= width * 0.65 &&
             y >= height * 0.53 && y <= height * 0.70) {
             app->gameStarted = true;
-            glfwSetWindowTitle(w, "CarFlare - Endless Drive | W A S D");
+            app->raceScore = 0;
+            app->scoredDistance = 0.0f;
+            glfwSetWindowTitle(w, "CarFlare - Score: 0 | W A S D");
         }
     }
 
@@ -350,6 +371,12 @@ class CarFlareImpl {
 
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(gpu, &properties);
+        const VkSampleCountFlags supported =
+            properties.limits.framebufferColorSampleCounts &
+            properties.limits.framebufferDepthSampleCounts;
+        if (supported & VK_SAMPLE_COUNT_8_BIT) msaaSamples = VK_SAMPLE_COUNT_8_BIT;
+        else if (supported & VK_SAMPLE_COUNT_4_BIT) msaaSamples = VK_SAMPLE_COUNT_4_BIT;
+        else if (supported & VK_SAMPLE_COUNT_2_BIT) msaaSamples = VK_SAMPLE_COUNT_2_BIT;
         std::cout << "GPU: " << properties.deviceName << '\n';
     }
 
@@ -764,12 +791,13 @@ class CarFlareImpl {
         model = glm::rotate(model, roll, glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::scale(model, scale);
         const glm::mat4 mvp = makeMVP(model);
-        struct PushData { glm::mat4 mvp; glm::vec4 color; glm::vec4 params; } pushData{mvp, color, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
+        const PushData pushData{
+            mvp, color, glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
             pipelineLayout, 0, 1, &textureDescriptorSet, 0, nullptr);
         vkCmdPushConstants(command, pipelineLayout,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(PushData), &pushData);
+            0, sizeof(pushData), &pushData);
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(command, 0, 1, &carModelBuffer, &offset);
         vkCmdDraw(command, carModelVertexCount, 1, 0, 0);
@@ -940,7 +968,7 @@ class CarFlareImpl {
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.samples = msaaSamples;
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
             if (vkCreateImage(
@@ -971,20 +999,58 @@ class CarFlareImpl {
         }
     }
 
+    void createMSAAColorResources() {
+        msaaColorImages.resize(swapImages.size());
+        msaaColorMemories.resize(swapImages.size());
+        msaaColorViews.resize(swapImages.size());
+
+        for (size_t i = 0; i < swapImages.size(); ++i) {
+            VkImageCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.extent = {swapExtent.width, swapExtent.height, 1};
+            info.mipLevels = 1;
+            info.arrayLayers = 1;
+            info.format = swapFormat;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            info.usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            info.samples = msaaSamples;
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+            if (vkCreateImage(device, &info, nullptr, &msaaColorImages[i]) != VK_SUCCESS)
+                throw std::runtime_error("MSAA color image creation failed");
+
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(device, msaaColorImages[i], &requirements);
+            VkMemoryAllocateInfo allocation{};
+            allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = findMemoryType(
+                requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device, &allocation, nullptr, &msaaColorMemories[i]) != VK_SUCCESS)
+                throw std::runtime_error("MSAA color memory allocation failed");
+            vkBindImageMemory(device, msaaColorImages[i], msaaColorMemories[i], 0);
+            msaaColorViews[i] = createImageView(
+                msaaColorImages[i], swapFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+    }
+
     void createRenderPass() {
         VkAttachmentDescription color{};
         color.format = swapFormat;
-        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.samples = msaaSamples;
         color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
         VkAttachmentDescription depth{};
         depth.format = depthFormat;
-        depth.samples = VK_SAMPLE_COUNT_1_BIT;
+        depth.samples = msaaSamples;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -993,7 +1059,17 @@ class CarFlareImpl {
         depth.finalLayout =
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-        VkAttachmentDescription attachments[] = {color, depth};
+        VkAttachmentDescription resolve{};
+        resolve.format = swapFormat;
+        resolve.samples = VK_SAMPLE_COUNT_1_BIT;
+        resolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        resolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        resolve.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        resolve.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        resolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        VkAttachmentDescription attachments[] = {color, depth, resolve};
 
         VkAttachmentReference colorRef{};
         colorRef.attachment = 0;
@@ -1004,11 +1080,16 @@ class CarFlareImpl {
         depthRef.layout =
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+        VkAttachmentReference resolveRef{};
+        resolveRef.attachment = 2;
+        resolveRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorRef;
         subpass.pDepthStencilAttachment = &depthRef;
+        subpass.pResolveAttachments = &resolveRef;
 
         VkSubpassDependency dependency{};
         dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
@@ -1025,7 +1106,7 @@ class CarFlareImpl {
 
         VkRenderPassCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        info.attachmentCount = 2;
+        info.attachmentCount = 3;
         info.pAttachments = attachments;
         info.subpassCount = 1;
         info.pSubpasses = &subpass;
@@ -1140,7 +1221,7 @@ class CarFlareImpl {
         VkPipelineMultisampleStateCreateInfo multisample{};
         multisample.sType =
             VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisample.rasterizationSamples = msaaSamples;
 
         VkPipelineDepthStencilStateCreateInfo depth{};
         depth.sType =
@@ -1178,7 +1259,7 @@ class CarFlareImpl {
         VkPushConstantRange push{};
         push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         push.offset = 0;
-        push.size = sizeof(glm::mat4) + sizeof(glm::vec4) * 2;
+        push.size = sizeof(PushData);
 
         VkPipelineLayoutCreateInfo layout{};
         layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1222,13 +1303,13 @@ class CarFlareImpl {
 
         for (size_t i = 0; i < imageViews.size(); ++i) {
             VkImageView attachments[] = {
-                imageViews[i], depthViews[i]
+                msaaColorViews[i], depthViews[i], imageViews[i]
             };
 
             VkFramebufferCreateInfo info{};
             info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             info.renderPass = renderPass;
-            info.attachmentCount = 2;
+            info.attachmentCount = 3;
             info.pAttachments = attachments;
             info.width = swapExtent.width;
             info.height = swapExtent.height;
@@ -1294,6 +1375,7 @@ class CarFlareImpl {
     void createSwapchainResources() {
         createSwapchain();
         createImageViews();
+        createMSAAColorResources();
         createDepthResources();
         createRenderPass();
         createPipeline();
@@ -1313,7 +1395,7 @@ class CarFlareImpl {
                        static_cast<float>(swapExtent.height);
 
         glm::mat4 projection = glm::perspective(
-            glm::radians(58.0f), aspect, 0.1f, 180.0f);
+            glm::radians(58.0f), aspect, 0.1f, 250.0f);
         projection[1][1] *= -1.0f;
 
         return projection * view * model;
@@ -1328,17 +1410,13 @@ class CarFlareImpl {
         model = glm::scale(model, scale);
 
         glm::mat4 mvp = makeMVP(model);
-        struct PushData {
-            glm::mat4 mvp;
-            glm::vec4 color;
-            glm::vec4 params;
-        } pushData{mvp, color, glm::vec4(0.0f)};
+        const PushData pushData{mvp, color, glm::vec4(0.0f)};
 
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
             pipelineLayout, 0, 1, &textureDescriptorSet, 0, nullptr);
-        vkCmdPushConstants(
-            command, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT |
-            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushData), &pushData);
+        vkCmdPushConstants(command, pipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(pushData), &pushData);
         vkCmdDraw(command, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
     }
 
@@ -1387,46 +1465,109 @@ class CarFlareImpl {
         vkCmdBindVertexBuffers(
             command, 0, 1, &vertexBuffer, &offset);
 
-        // Home screen: a dark title panel and a green, clickable PLAY button.
-        // The menu is rendered instead of the driving scene until clicked.
+        // Home screen – redesigned for the PBR lighting so panels stay readable
+        // and the PLAY button is large, bright, and clearly clickable.
         if (!gameStarted) {
-            drawCube(command, {0.0f, 2.1f, -2.0f}, {4.7f, 2.0f, 0.18f},
-                     {0.055f, 0.075f, 0.105f, 1.0f});
-            drawCube(command, {0.0f, 2.1f, -1.88f}, {4.45f, 1.78f, 0.08f},
-                     {0.09f, 0.13f, 0.18f, 1.0f});
-            // Bright accent strips give the menu a clean game-launcher look.
-            drawCube(command, {0.0f, 3.02f, -1.78f}, {3.8f, 0.035f, 0.035f},
-                     {0.12f, 0.78f, 0.95f, 1.0f});
-            drawCube(command, {0.0f, 1.30f, -1.72f}, {1.55f, 0.34f, 0.14f},
-                     {0.12f, 0.72f, 0.36f, 1.0f});
-            drawCube(command, {0.0f, 1.30f, -1.62f}, {1.40f, 0.23f, 0.055f},
-                     {0.16f, 0.84f, 0.43f, 1.0f});
-            // Tiny block-letter PLAY label, built from the same cube geometry.
-            const glm::vec4 labelColor(0.96f, 1.0f, 0.97f, 1.0f);
-            const float labelY = 1.30f;
-            const float labelZ = -1.54f;
-            // P
-            drawCube(command, {-0.43f, labelY, labelZ}, {0.045f, 0.15f, 0.025f}, labelColor);
-            drawCube(command, {-0.35f, labelY + 0.065f, labelZ}, {0.12f, 0.035f, 0.025f}, labelColor);
-            drawCube(command, {-0.35f, labelY, labelZ}, {0.12f, 0.035f, 0.025f}, labelColor);
-            drawCube(command, {-0.28f, labelY + 0.035f, labelZ}, {0.035f, 0.045f, 0.025f}, labelColor);
-            // L
-            drawCube(command, {-0.12f, labelY, labelZ}, {0.04f, 0.15f, 0.025f}, labelColor);
-            drawCube(command, {-0.06f, labelY - 0.065f, labelZ}, {0.10f, 0.035f, 0.025f}, labelColor);
+            // Outer frame (deep navy)
+            drawCube(command, {0.0f, 2.15f, -2.05f}, {5.10f, 2.35f, 0.22f},
+                     {0.10f, 0.14f, 0.22f, 1.0f});
+            // Main panel face
+            drawCube(command, {0.0f, 2.15f, -1.90f}, {4.70f, 2.05f, 0.10f},
+                     {0.16f, 0.22f, 0.34f, 1.0f});
+            // Inner recessed panel
+            drawCube(command, {0.0f, 2.15f, -1.82f}, {4.30f, 1.75f, 0.06f},
+                     {0.12f, 0.17f, 0.27f, 1.0f});
+
+            // Top cyan accent bar
+            drawCube(command, {0.0f, 3.15f, -1.72f}, {4.00f, 0.055f, 0.04f},
+                     {0.25f, 0.85f, 1.00f, 1.0f});
+            // Bottom cyan accent bar
+            drawCube(command, {0.0f, 1.15f, -1.72f}, {4.00f, 0.055f, 0.04f},
+                     {0.25f, 0.85f, 1.00f, 1.0f});
+
+            // Side vertical accents
+            drawCube(command, {-2.25f, 2.15f, -1.72f}, {0.055f, 0.90f, 0.04f},
+                     {0.25f, 0.85f, 1.00f, 1.0f});
+            drawCube(command, { 2.25f, 2.15f, -1.72f}, {0.055f, 0.90f, 0.04f},
+                     {0.25f, 0.85f, 1.00f, 1.0f});
+
+            // Title bar background
+            drawCube(command, {0.0f, 2.75f, -1.74f}, {3.40f, 0.28f, 0.05f},
+                     {0.08f, 0.12f, 0.20f, 1.0f});
+
+            // "CAR FLARE" title letters (simple block style, bright white)
+            const glm::vec4 titleCol(0.95f, 0.97f, 1.00f, 1.0f);
+            const float ty = 2.75f;
+            const float tz = -1.68f;
+            // C
+            drawCube(command, {-1.45f, ty, tz}, {0.06f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {-1.32f, ty + 0.09f, tz}, {0.14f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {-1.32f, ty - 0.09f, tz}, {0.14f, 0.05f, 0.03f}, titleCol);
             // A
-            drawCube(command, {0.10f, labelY, labelZ}, {0.04f, 0.15f, 0.025f}, labelColor);
-            drawCube(command, {0.22f, labelY, labelZ}, {0.04f, 0.15f, 0.025f}, labelColor);
-            drawCube(command, {0.16f, labelY + 0.065f, labelZ}, {0.10f, 0.035f, 0.025f}, labelColor);
-            drawCube(command, {0.16f, labelY, labelZ}, {0.10f, 0.025f, 0.025f}, labelColor);
+            drawCube(command, {-1.05f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {-0.88f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {-0.965f, ty + 0.09f, tz}, {0.14f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {-0.965f, ty - 0.02f, tz}, {0.12f, 0.04f, 0.03f}, titleCol);
+            // R
+            drawCube(command, {-0.65f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {-0.52f, ty + 0.09f, tz}, {0.12f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {-0.52f, ty + 0.02f, tz}, {0.12f, 0.04f, 0.03f}, titleCol);
+            drawCube(command, {-0.48f, ty + 0.055f, tz}, {0.05f, 0.07f, 0.03f}, titleCol);
+            drawCube(command, {-0.48f, ty - 0.07f, tz}, {0.05f, 0.08f, 0.03f}, titleCol);
+            // space
+            // F
+            drawCube(command, {-0.15f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {-0.02f, ty + 0.09f, tz}, {0.14f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {-0.02f, ty + 0.01f, tz}, {0.11f, 0.04f, 0.03f}, titleCol);
+            // L
+            drawCube(command, {0.25f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {0.38f, ty - 0.09f, tz}, {0.13f, 0.05f, 0.03f}, titleCol);
+            // A
+            drawCube(command, {0.60f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {0.77f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {0.685f, ty + 0.09f, tz}, {0.14f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {0.685f, ty - 0.02f, tz}, {0.12f, 0.04f, 0.03f}, titleCol);
+            // R
+            drawCube(command, {1.00f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {1.13f, ty + 0.09f, tz}, {0.12f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {1.13f, ty + 0.02f, tz}, {0.12f, 0.04f, 0.03f}, titleCol);
+            drawCube(command, {1.17f, ty + 0.055f, tz}, {0.05f, 0.07f, 0.03f}, titleCol);
+            drawCube(command, {1.17f, ty - 0.07f, tz}, {0.05f, 0.08f, 0.03f}, titleCol);
+            // E
+            drawCube(command, {1.40f, ty, tz}, {0.05f, 0.18f, 0.03f}, titleCol);
+            drawCube(command, {1.53f, ty + 0.09f, tz}, {0.13f, 0.05f, 0.03f}, titleCol);
+            drawCube(command, {1.53f, ty, tz}, {0.11f, 0.04f, 0.03f}, titleCol);
+            drawCube(command, {1.53f, ty - 0.09f, tz}, {0.13f, 0.05f, 0.03f}, titleCol);
+
+            // Large green PLAY button (outer)
+            drawCube(command, {0.0f, 1.55f, -1.70f}, {1.90f, 0.42f, 0.12f},
+                     {0.10f, 0.65f, 0.32f, 1.0f});
+            // Inner brighter face
+            drawCube(command, {0.0f, 1.55f, -1.60f}, {1.70f, 0.30f, 0.06f},
+                     {0.18f, 0.88f, 0.42f, 1.0f});
+
+            // PLAY letters on the button (larger & clearer)
+            const glm::vec4 playCol(1.00f, 1.00f, 0.98f, 1.0f);
+            const float py = 1.55f;
+            const float pz = -1.52f;
+            // P
+            drawCube(command, {-0.55f, py, pz}, {0.07f, 0.20f, 0.035f}, playCol);
+            drawCube(command, {-0.42f, py + 0.085f, pz}, {0.16f, 0.055f, 0.035f}, playCol);
+            drawCube(command, {-0.42f, py + 0.01f, pz}, {0.16f, 0.05f, 0.035f}, playCol);
+            drawCube(command, {-0.36f, py + 0.05f, pz}, {0.06f, 0.08f, 0.035f}, playCol);
+            // L
+            drawCube(command, {-0.15f, py, pz}, {0.07f, 0.20f, 0.035f}, playCol);
+            drawCube(command, {-0.02f, py - 0.085f, pz}, {0.15f, 0.055f, 0.035f}, playCol);
+            // A
+            drawCube(command, {0.22f, py, pz}, {0.07f, 0.20f, 0.035f}, playCol);
+            drawCube(command, {0.40f, py, pz}, {0.07f, 0.20f, 0.035f}, playCol);
+            drawCube(command, {0.31f, py + 0.085f, pz}, {0.18f, 0.055f, 0.035f}, playCol);
+            drawCube(command, {0.31f, py - 0.01f, pz}, {0.15f, 0.045f, 0.035f}, playCol);
             // Y
-            drawCube(command, {0.36f, labelY + 0.045f, labelZ}, {0.04f, 0.07f, 0.025f}, labelColor, -0.65f);
-            drawCube(command, {0.45f, labelY + 0.045f, labelZ}, {0.04f, 0.07f, 0.025f}, labelColor, 0.65f);
-            drawCube(command, {0.405f, labelY - 0.055f, labelZ}, {0.04f, 0.07f, 0.025f}, labelColor);
-            // Small cyan side accents.
-            drawCube(command, {-2.05f, 2.1f, -1.70f}, {0.045f, 0.62f, 0.04f},
-                     {0.12f, 0.78f, 0.95f, 1.0f});
-            drawCube(command, { 2.05f, 2.1f, -1.70f}, {0.045f, 0.62f, 0.04f},
-                     {0.12f, 0.78f, 0.95f, 1.0f});
+            drawCube(command, {0.58f, py + 0.06f, pz}, {0.07f, 0.10f, 0.035f}, playCol, -0.55f);
+            drawCube(command, {0.72f, py + 0.06f, pz}, {0.07f, 0.10f, 0.035f}, playCol,  0.55f);
+            drawCube(command, {0.65f, py - 0.07f, pz}, {0.07f, 0.10f, 0.035f}, playCol);
+
             vkCmdEndRenderPass(command);
             if (vkEndCommandBuffer(command) != VK_SUCCESS)
                 throw std::runtime_error("Command buffer recording failed");
@@ -1509,52 +1650,103 @@ class CarFlareImpl {
 
         // Road scrolling follows vehicle speed; integration remains frame-time based.
         roadTravel += speed * dt;
-        const float roadOffset = std::fmod(roadTravel * 0.9f + 800.0f, 8.0f);
-
-        // Ground: muted grass and dry roadside earth beyond the asphalt.
-        drawCube(command, {0.0f, -0.52f, -30.0f}, {45.0f, 0.22f, 70.0f},
-                 {0.25f, 0.34f, 0.20f, 1.0f});
-        drawCube(command, {0.0f, -0.31f, -28.0f}, {5.65f, 0.16f, 62.0f},
-                 {0.31f, 0.32f, 0.31f, 1.0f});
-
-        // Asphalt carriageway and narrow, pale concrete road edges.
-        drawCube(command, {0.0f, -0.20f, -28.0f}, {5.15f, 0.12f, 62.0f},
-                 {0.19f, 0.20f, 0.21f, 1.0f});
-        drawCube(command, {-5.28f, -0.17f, -28.0f}, {0.16f, 0.10f, 62.0f},
-                 {0.57f, 0.58f, 0.55f, 1.0f});
-        drawCube(command, { 5.28f, -0.17f, -28.0f}, {0.16f, 0.10f, 62.0f},
-                 {0.57f, 0.58f, 0.55f, 1.0f});
-
-        // Continuous white edge lines.
-        drawCube(command, {-4.90f, -0.065f, -28.0f}, {0.045f, 0.018f, 62.0f},
-                 {0.86f, 0.87f, 0.84f, 1.0f});
-        drawCube(command, { 4.90f, -0.065f, -28.0f}, {0.045f, 0.018f, 62.0f},
-                 {0.86f, 0.87f, 0.84f, 1.0f});
-
-        // Broken white centre line, scrolling toward the camera.
-        for (int i = 0; i < 18; ++i) {
-            const float z = -78.0f + std::fmod(i * 8.0f + roadOffset + 88.0f, 88.0f);
-            drawCube(command, {0.0f, -0.055f, z}, {0.055f, 0.018f, 2.15f},
-                     {0.91f, 0.92f, 0.88f, 1.0f});
-        }
-
-        // Steel guardrails with regularly spaced grey support posts.
-        for (int i = 0; i < 20; ++i) {
-            const float z = -82.0f + std::fmod(i * 5.0f + roadOffset * 0.7f + 90.0f, 90.0f);
-            for (int side : {-1, 1}) {
-                const float x = side * 5.65f;
-                drawCube(command, {x, 0.02f, z}, {0.075f, 0.42f, 0.075f},
-                         {0.43f, 0.45f, 0.44f, 1.0f});
-                // Small reflector on each post.
-                drawCube(command, {x - side * 0.06f, 0.20f, z},
-                         {0.025f, 0.075f, 0.07f},
-                         {0.82f, 0.78f, 0.58f, 1.0f});
+        // Score distance travelled under power; reversing cannot farm points.
+        if (speed > 0.0f) {
+            scoredDistance += speed * dt;
+            const uint32_t newScore = static_cast<uint32_t>(scoredDistance * 10.0f);
+            if (newScore != raceScore) {
+                raceScore = newScore;
+                glfwSetWindowTitle(window,
+                    ("CarFlare - Score: " + std::to_string(raceScore) +
+                     " | W A S D").c_str());
             }
         }
-        drawCube(command, {-5.66f, 0.42f, -28.0f}, {0.09f, 0.09f, 45.0f},
-                 {0.48f, 0.50f, 0.49f, 1.0f});
-        drawCube(command, { 5.66f, 0.42f, -28.0f}, {0.09f, 0.09f, 45.0f},
-                 {0.48f, 0.50f, 0.49f, 1.0f});
+        const float roadOffset = std::fmod(roadTravel * 0.9f + 800.0f, 8.0f);
+
+        // Realistic segmented highway – extends to the far horizon.
+        // Darker materials so the near field no longer looks washed out.
+        const glm::vec4 grassCol(0.22f, 0.34f, 0.18f, 1.0f);
+        const glm::vec4 dirtCol(0.34f, 0.29f, 0.21f, 1.0f);
+        const glm::vec4 asphaltCol(0.16f, 0.17f, 0.18f, 1.0f);
+        const glm::vec4 wearCol(0.12f, 0.13f, 0.14f, 1.0f);
+        const glm::vec4 shoulderCol(0.28f, 0.27f, 0.24f, 1.0f);
+        const glm::vec4 kerbCol(0.45f, 0.44f, 0.41f, 1.0f);
+        const glm::vec4 lineCol(0.88f, 0.87f, 0.82f, 1.0f);
+        const glm::vec4 railCol(0.50f, 0.52f, 0.50f, 1.0f);
+        const glm::vec4 postCol(0.34f, 0.35f, 0.34f, 1.0f);
+        const glm::vec4 reflectorCol(0.88f, 0.72f, 0.22f, 1.0f);
+
+        const float segLen = 7.0f;
+        const float segOverlap = 0.12f;
+        // Enough segments so the road reaches the top edge of the window
+        const int numSegs = 28;
+
+        for (int i = 0; i < numSegs; ++i) {
+            const float z = -1.0f - i * segLen;
+            // drawCube takes half-extents.  Using the full segment length here
+            // made neighbouring coplanar surfaces overlap by almost a whole
+            // segment, causing z-fighting on rails and painted edge lines.
+            const float halfLen = (segLen + segOverlap) * 0.5f;
+
+            // Grass
+            drawCube(command, {-14.5f, -0.55f, z}, {16.0f, 0.22f, halfLen}, grassCol);
+            drawCube(command, { 14.5f, -0.55f, z}, {16.0f, 0.22f, halfLen}, grassCol);
+
+            // Dirt verge
+            drawCube(command, {-7.4f, -0.40f, z}, {2.4f, 0.14f, halfLen}, dirtCol);
+            drawCube(command, { 7.4f, -0.40f, z}, {2.4f, 0.14f, halfLen}, dirtCol);
+
+            // Gravel shoulder
+            drawCube(command, {0.0f, -0.30f, z}, {6.0f, 0.14f, halfLen}, shoulderCol);
+
+            // Asphalt
+            drawCube(command, {0.0f, -0.20f, z}, {5.20f, 0.11f, halfLen}, asphaltCol);
+
+            // Tyre-wear strips
+            drawCube(command, {-1.55f, -0.175f, z}, {1.15f, 0.02f, halfLen}, wearCol);
+            drawCube(command, { 1.55f, -0.175f, z}, {1.15f, 0.02f, halfLen}, wearCol);
+
+            // Kerbs
+            drawCube(command, {-5.35f, -0.14f, z}, {0.18f, 0.12f, halfLen}, kerbCol);
+            drawCube(command, { 5.35f, -0.14f, z}, {0.18f, 0.12f, halfLen}, kerbCol);
+
+            // Solid white edge (shoulder) lines – continuous
+            drawCube(command, {-4.92f, -0.045f, z}, {0.09f, 0.022f, halfLen}, lineCol);
+            drawCube(command, { 4.92f, -0.045f, z}, {0.09f, 0.022f, halfLen}, lineCol);
+        }
+
+        // Broken centre line – realistic highway proportions:
+        // ~3 unit dash, ~9 unit gap (1:3 ratio), ~10 cm wide paint.
+        const float dashLen = 3.2f;
+        const float dashGap = 9.0f;
+        const float dashPeriod = dashLen + dashGap;
+        for (int i = 0; i < 28; ++i) {
+            const float z = -1.5f - i * dashPeriod
+                          + std::fmod(roadOffset * 0.85f, dashPeriod);
+            drawCube(command, {0.0f, -0.042f, z},
+                     {0.10f, 0.020f, dashLen}, lineCol);
+        }
+
+        // Guardrail posts + amber reflectors
+        for (int i = 0; i < 36; ++i) {
+            const float z = -125.0f + std::fmod(i * 4.5f + roadOffset * 0.7f + 135.0f, 135.0f);
+            for (int side : {-1, 1}) {
+                const float x = side * 5.75f;
+                drawCube(command, {x, 0.05f, z}, {0.08f, 0.45f, 0.08f}, postCol);
+                drawCube(command, {x - side * 0.07f, 0.28f, z},
+                         {0.03f, 0.08f, 0.08f}, reflectorCol);
+            }
+        }
+
+        // Segmented dual rails
+        for (int i = 0; i < numSegs; ++i) {
+            const float z = -1.0f - i * segLen;
+            const float halfLen = (segLen + segOverlap) * 0.5f;
+            drawCube(command, {-5.75f, 0.48f, z}, {0.10f, 0.08f, halfLen}, railCol);
+            drawCube(command, { 5.75f, 0.48f, z}, {0.10f, 0.08f, halfLen}, railCol);
+            drawCube(command, {-5.75f, 0.28f, z}, {0.10f, 0.07f, halfLen}, railCol);
+            drawCube(command, { 5.75f, 0.28f, z}, {0.10f, 0.07f, halfLen}, railCol);
+        }
 
         // Load an external OBJ when assets/car.obj exists; otherwise keep the
         // original procedural car so the game remains playable out of the box.
@@ -1640,6 +1832,18 @@ class CarFlareImpl {
         for (auto view : imageViews)
             vkDestroyImageView(device, view, nullptr);
         imageViews.clear();
+
+        for (auto view : msaaColorViews)
+            vkDestroyImageView(device, view, nullptr);
+        msaaColorViews.clear();
+
+        for (auto image : msaaColorImages)
+            vkDestroyImage(device, image, nullptr);
+        msaaColorImages.clear();
+
+        for (auto memory : msaaColorMemories)
+            vkFreeMemory(device, memory, nullptr);
+        msaaColorMemories.clear();
 
         for (auto view : depthViews)
             vkDestroyImageView(device, view, nullptr);
